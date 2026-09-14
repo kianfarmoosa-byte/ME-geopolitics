@@ -1,0 +1,6 @@
+{
+  "name": "Geopolitical Actor Graph Explorer",
+  "description": "سامانه تحلیل و گراف تعاملی، چندلایه و جامع روابط بازیگران ژئوپلیتیک بر اساس دادگان تفصیلی ۲۰۲۶",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
