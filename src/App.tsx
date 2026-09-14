@@ -10,6 +10,8 @@ import { NetworkAnalyticsModal } from './components/NetworkAnalyticsModal';
 import { ActorDirectory } from './components/ActorDirectory';
 import { Header } from './components/Header';
 import { LegendModal } from './components/LegendModal';
+import { TimelineToolbar } from './components/TimelineToolbar';
+import { getEraRelationships } from './data/timelineEras';
 import { 
   Filter, 
   ChevronRight, 
@@ -25,6 +27,9 @@ export function App() {
   const [currentView, setCurrentView] = useState<'graph' | 'directory'>('graph');
   const [clusterMode, setClusterMode] = useState<'free' | 'category'>('free');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  // Timeline Era State ('all' or specific era id like 'era_oct7_war', 'era_beijing_accord', etc.)
+  const [selectedTimelineEraId, setSelectedTimelineEraId] = useState<string | 'all'>('all');
 
   // Modals
   const [isLegendOpen, setIsLegendOpen] = useState(false);
@@ -58,10 +63,15 @@ export function App() {
     return map;
   }, []);
 
+  // Compute Active Relationships according to Selected Timeline Era (with historical overrides)
+  const currentEraRelationships = useMemo(() => {
+    return getEraRelationships(allRelationships, selectedTimelineEraId);
+  }, [selectedTimelineEraId]);
+
   // Filter and prepare Graph Nodes & Links
   const { nodes, links } = useMemo(() => {
-    return prepareGraphData(allActors, allRelationships, filters);
-  }, [filters]);
+    return prepareGraphData(allActors, currentEraRelationships, filters);
+  }, [currentEraRelationships, filters]);
 
   // Scenario Presets Handler
   const handleApplyPreset = useCallback((presetKey: string) => {
@@ -190,20 +200,34 @@ export function App() {
         {/* Primary Viewport: Either D3 Graph Canvas OR Actor Directory */}
         <main className="flex-1 relative h-full w-full overflow-hidden" id="primary-viewport">
           {currentView === 'graph' ? (
-            <GraphCanvas
-              nodes={nodes}
-              links={links}
-              allActorsMap={allActorsMap}
-              selectedActor={selectedActor}
-              onSelectActor={setSelectedActor}
-              onOpenDetailsModal={(actor) => {
-                setSelectedActor(actor);
-                setIsDetailsDrawerOpen(true);
-              }}
-              highlightedPathNodeIds={highlightedPathNodeIds}
-              searchQuery={filters.searchQuery}
-              clusterMode={clusterMode}
-            />
+            <>
+              <GraphCanvas
+                nodes={nodes}
+                links={links}
+                allActorsMap={allActorsMap}
+                selectedActor={selectedActor}
+                onSelectActor={setSelectedActor}
+                onOpenDetailsModal={(actor) => {
+                  setSelectedActor(actor);
+                  setIsDetailsDrawerOpen(true);
+                }}
+                highlightedPathNodeIds={highlightedPathNodeIds}
+                searchQuery={filters.searchQuery}
+                clusterMode={clusterMode}
+              />
+
+              {/* Bottom Interactive Geopolitical Timeline Toolbar */}
+              <div className="absolute bottom-2 left-2 right-2 sm:left-4 sm:right-4 z-20 pointer-events-auto">
+                <TimelineToolbar
+                  selectedEraId={selectedTimelineEraId}
+                  onSelectEra={(eraId) => setSelectedTimelineEraId(eraId)}
+                  allActorsMap={allActorsMap}
+                  onSelectActor={(actor) => {
+                    setSelectedActor(actor);
+                  }}
+                />
+              </div>
+            </>
           ) : (
             <ActorDirectory
               actors={allActors}
@@ -221,7 +245,7 @@ export function App() {
       {selectedActor && isDetailsDrawerOpen && (
         <ActorDetailsModal
           actor={selectedActor}
-          relationships={allRelationships}
+          relationships={currentEraRelationships}
           allActorsMap={allActorsMap}
           onClose={() => setIsDetailsDrawerOpen(false)}
           onSelectActor={(actor) => {

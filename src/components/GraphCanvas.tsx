@@ -3,6 +3,12 @@ import * as d3 from 'd3';
 import { GraphNode, GraphLink, ActorData, RelationType } from '../types';
 import { CATEGORY_COLORS, RELATION_CONFIG } from '../data';
 import { 
+  FocusViewOverlay, 
+  STRATEGIC_LAYERS, 
+  StrategicLayerType, 
+  getLinkLayer 
+} from './FocusViewOverlay';
+import { 
   ZoomIn, 
   ZoomOut, 
   Maximize2, 
@@ -14,7 +20,8 @@ import {
   Target,
   FileText,
   Network,
-  Share2
+  Share2,
+  Layers
 } from 'lucide-react';
 
 interface GraphCanvasProps {
@@ -49,9 +56,112 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [hoveredLink, setHoveredLink] = useState<GraphLink | null>(null);
   const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
-  const [showLabels, setShowLabels] = useState(true);
+  
+  // Intelligent Label Density (LOD): 'auto' prioritizes influential actors at zoom-out, 'all' shows all, 'none' hides
+  const [labelDensityMode, setLabelDensityMode] = useState<'auto' | 'all' | 'none'>('auto');
+  const [zoomScale, setZoomScale] = useState<number>(100);
+  const currentZoomKRef = useRef<number>(1.0);
+
   const [showRipples, setShowRipples] = useState(true);
   const [expandToSecondDegree, setExpandToSecondDegree] = useState(false);
+
+  // Focus View State (Activated via Double-Click on any Node)
+  const [focusedActor, setFocusedActor] = useState<ActorData | null>(null);
+  const [focusLayer, setFocusLayer] = useState<StrategicLayerType>('all');
+  const isFocusMode = Boolean(focusedActor);
+
+  // Direct links connected to focusedActor
+  const focusedDirectLinks = useMemo(() => {
+    if (!focusedActor) return [];
+    return links.filter((l) => {
+      const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
+      const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
+      return srcId === focusedActor.id || tgtId === focusedActor.id;
+    });
+  }, [focusedActor, links]);
+
+  // Neighbor lookup map for focused actor with layer categorization
+  const focusedNeighborsMap = useMemo(() => {
+    if (!focusedActor) return new Map<string, { neighbor: ActorData; links: GraphLink[]; layer: StrategicLayerType }>();
+    const map = new Map<string, { neighbor: ActorData; links: GraphLink[]; layer: StrategicLayerType }>();
+
+    focusedDirectLinks.forEach((l) => {
+      const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
+      const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
+      const neighborId = srcId === focusedActor.id ? tgtId : srcId;
+      const neighbor = allActorsMap.get(neighborId);
+      if (!neighbor) return;
+
+      const layer = getLinkLayer(l.type);
+      if (!map.has(neighborId)) {
+        map.set(neighborId, { neighbor, links: [l], layer });
+      } else {
+        map.get(neighborId)!.links.push(l);
+      }
+    });
+
+    return map;
+  }, [focusedActor, focusedDirectLinks, allActorsMap]);
+
+  // Set of neighbor IDs that match current focusLayer
+  const activeFocusNeighborIds = useMemo(() => {
+    if (!focusedActor) return new Set<string>();
+    const set = new Set<string>();
+    focusedNeighborsMap.forEach((entry, id) => {
+      if (focusLayer === 'all' || entry.links.some((l) => getLinkLayer(l.type) === focusLayer)) {
+        set.add(id);
+      }
+    });
+    return set;
+  }, [focusedActor, focusedNeighborsMap, focusLayer]);
+
+  // Focus View entry handler: sets focal actor, resets layer, and smoothly centers camera
+  const handleEnterFocusView = useCallback((actor: ActorData) => {
+    setFocusedActor(actor);
+    onSelectActor(actor);
+    setFocusLayer('all');
+
+    if (svgRef.current && zoomBehaviorRef.current && containerRef.current) {
+      const nodeEl = nodes.find((n) => n.id === actor.id);
+      if (nodeEl && nodeEl.x !== undefined && nodeEl.y !== undefined) {
+        const width = containerRef.current.clientWidth;
+        const height = containerRef.current.clientHeight;
+
+        d3.select(svgRef.current)
+          .transition()
+          .duration(750)
+          .ease(d3.easeCubicOut)
+          .call(
+            zoomBehaviorRef.current.transform,
+            d3.zoomIdentity
+              .translate(width / 2, height / 2)
+              .scale(1.55)
+              .translate(-nodeEl.x, -nodeEl.y)
+          );
+      }
+    }
+  }, [nodes, onSelectActor]);
+
+  // Focus View exit handler: clears focus and resets zoom smoothly
+  const handleExitFocusView = useCallback(() => {
+    setFocusedActor(null);
+    setFocusLayer('all');
+    if (svgRef.current && zoomBehaviorRef.current && containerRef.current) {
+      const width = containerRef.current.clientWidth;
+      const height = containerRef.current.clientHeight;
+
+      d3.select(svgRef.current)
+        .transition()
+        .duration(600)
+        .call(
+          zoomBehaviorRef.current.transform,
+          d3.zoomIdentity
+            .translate(width / 2, height / 2)
+            .scale(0.85)
+            .translate(-width / 2, -height / 2)
+        );
+    }
+  }, []);
 
   // Compute connected nodes for hovered or selected node
   const activeFocusId = selectedActor?.id || hoveredNodeId || null;
@@ -120,16 +230,136 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     return { alliances, conflicts, economic, diplomatic, proxy, volatile };
   }, [selectedActor, links]);
 
-  // Keyboard shortcut: Esc to clear selection
+  // Keyboard shortcut: Esc to clear focus or selection
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && selectedActor) {
-        onSelectActor(null);
+      if (e.key === 'Escape') {
+        if (focusedActor) {
+          handleExitFocusView();
+        } else if (selectedActor) {
+          onSelectActor(null);
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedActor, onSelectActor]);
+  }, [focusedActor, selectedActor, handleExitFocusView, onSelectActor]);
+
+  // Synchronized refs to avoid stale closures in high-frequency D3 zoom callbacks
+  const labelDensityModeRef = useRef<'auto' | 'all' | 'none'>('auto');
+  labelDensityModeRef.current = labelDensityMode;
+
+  const isFocusModeRef = useRef(isFocusMode);
+  isFocusModeRef.current = isFocusMode;
+
+  const focusedActorRef = useRef(focusedActor);
+  focusedActorRef.current = focusedActor;
+
+  const activeFocusNeighborIdsRef = useRef(activeFocusNeighborIds);
+  activeFocusNeighborIdsRef.current = activeFocusNeighborIds;
+
+  const selectedActorRef = useRef(selectedActor);
+  selectedActorRef.current = selectedActor;
+
+  const hoveredNodeIdRef = useRef(hoveredNodeId);
+  hoveredNodeIdRef.current = hoveredNodeId;
+
+  const firstDegreeNeighborsRef = useRef(firstDegreeNeighbors);
+  firstDegreeNeighborsRef.current = firstDegreeNeighbors;
+
+  const highlightedPathNodeIdsRef = useRef(highlightedPathNodeIds);
+  highlightedPathNodeIdsRef.current = highlightedPathNodeIds;
+
+  // Level-of-Detail (LOD) function to adaptively balance label visibility
+  // Prioritizes influential actors (influenceScore 4 and 5) and selected nodes when zoomed out
+  const applyLabelsLOD = useCallback((kVal?: number) => {
+    if (!gRef.current) return;
+    const k = kVal ?? currentZoomKRef.current;
+    const mode = labelDensityModeRef.current;
+    const inFocus = isFocusModeRef.current;
+    const fActor = focusedActorRef.current;
+    const fNeighbors = activeFocusNeighborIdsRef.current;
+    const selActor = selectedActorRef.current;
+    const hovId = hoveredNodeIdRef.current;
+    const directNeighbors = firstDegreeNeighborsRef.current;
+    const pathNodes = highlightedPathNodeIdsRef.current;
+
+    const g = d3.select(gRef.current);
+
+    // Update Persian main labels
+    g.selectAll<SVGTextElement, GraphNode>('.node-label')
+      .attr('display', (d) => {
+        // Focus view: only focal actor and active neighbors
+        if (inFocus && fActor) {
+          return fActor.id === d.id || fNeighbors.has(d.id) ? 'block' : 'none';
+        }
+
+        if (mode === 'none') return 'none';
+        if (mode === 'all') return 'block';
+
+        // Auto LOD mode:
+        // Priority 1: User interaction targets (selected, hovered, in path) ALWAYS show
+        if (selActor?.id === d.id || hovId === d.id || (pathNodes && pathNodes.includes(d.id))) {
+          return 'block';
+        }
+
+        // Priority 2: Direct 1st-degree neighbors of selected actor ALWAYS show
+        if (selActor && directNeighbors.has(d.id)) {
+          return 'block';
+        }
+
+        // Priority 3: Zoom level and influence score / degree hierarchy
+        const inf = d.influenceScore || 3;
+        const deg = d.degree || 0;
+
+        // Close-up view (k >= 1.25): Display all labels comfortably
+        if (k >= 1.25) return 'block';
+
+        // Standard 1:1 view (0.95 <= k < 1.25): Show actors with influence >= 3 or degree >= 2
+        if (k >= 0.95) return inf >= 3 || deg >= 2 ? 'block' : 'none';
+
+        // Moderate zoom-out (0.70 <= k < 0.95): Show actors with influence >= 4 or degree >= 3
+        if (k >= 0.70) return inf >= 4 || deg >= 3 ? 'block' : 'none';
+
+        // Deep zoom-out (0.45 <= k < 0.70): Show top regional powers (influence >= 5 or degree >= 5)
+        if (k >= 0.45) return inf >= 5 || deg >= 5 ? 'block' : 'none';
+
+        // Macro bird's-eye view (k < 0.45): Show only top strategic core actors (influence 5 and degree >= 2)
+        return inf >= 5 && deg >= 2 ? 'block' : 'none';
+      })
+      .attr('font-size', (d) => {
+        if (inFocus && fActor?.id === d.id) return '13px';
+        if (k < 0.75 && (d.influenceScore >= 5 || selActor?.id === d.id)) {
+          return '12px'; // Maintain crisp visibility for key hegemons when zoomed out
+        }
+        return d.influenceScore >= 5 ? '12px' : '10.5px';
+      })
+      .attr('font-weight', (d) => {
+        if (inFocus && (fActor?.id === d.id || fNeighbors.has(d.id))) return '800';
+        if (selActor?.id === d.id || (selActor && directNeighbors.has(d.id))) return '700';
+        if (k < 0.8 && d.influenceScore >= 5) return '800';
+        return '600';
+      });
+
+    // Update English / secondary sublabels
+    g.selectAll<SVGTextElement, GraphNode>('.node-sublabel')
+      .attr('display', (d) => {
+        if (inFocus && fActor) {
+          return fActor.id === d.id || fNeighbors.has(d.id) ? 'block' : 'none';
+        }
+
+        if (mode === 'none') return 'none';
+        if (mode === 'all') return 'block';
+
+        // Always show for hovered/selected
+        if (selActor?.id === d.id || hovId === d.id) return 'block';
+
+        // When zoomed out (k < 0.95), hide all sublabels to avoid vertical clutter
+        if (k < 0.95) return 'none';
+
+        return d.influenceScore >= 3 ? 'block' : 'none';
+      });
+  }, []);
 
   // Set up D3 simulation
   useEffect(() => {
@@ -218,9 +448,14 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .scaleExtent([0.15, 4])
       .on('zoom', (event) => {
         g.attr('transform', event.transform);
+        currentZoomKRef.current = event.transform.k;
+        applyLabelsLOD(event.transform.k);
+      })
+      .on('end', (event) => {
+        setZoomScale(Math.round(event.transform.k * 100));
       });
 
-    svg.call(zoom);
+    svg.call(zoom).on('dblclick.zoom', null);
     zoomBehaviorRef.current = zoom;
 
     // Drag setup
@@ -271,6 +506,26 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .attr('class', 'node-group cursor-pointer select-none')
       .call(drag as unknown as (selection: d3.Selection<SVGGElement, GraphNode & d3.SimulationNodeDatum, SVGGElement, unknown>) => void);
 
+    // Focus View Pulsing Target Ring (visible in Focus View on focal node)
+    nodeEnter
+      .append('circle')
+      .attr('class', 'node-focus-ring')
+      .attr('fill', 'none')
+      .attr('stroke', '#38bdf8')
+      .attr('display', 'none')
+      .attr('pointer-events', 'none');
+
+    // Focus View Reticle (dashed target ring around focal node)
+    nodeEnter
+      .append('circle')
+      .attr('class', 'focus-reticle')
+      .attr('fill', 'none')
+      .attr('stroke', '#06b6d4')
+      .attr('stroke-width', 1.5)
+      .attr('stroke-dasharray', '5,4')
+      .attr('display', 'none')
+      .attr('pointer-events', 'none');
+
     // Animated Pulse Ring (visible only when clicked/selected)
     nodeEnter
       .append('circle')
@@ -318,7 +573,11 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .attr('text-anchor', 'middle')
       .attr('pointer-events', 'none')
       .style('font-family', 'Vazirmatn, sans-serif')
-      .style('font-weight', '600');
+      .style('font-weight', '600')
+      .style('paint-order', 'stroke fill')
+      .style('stroke', '#020617')
+      .style('stroke-width', '3.5px')
+      .style('stroke-linejoin', 'round');
 
     // Subtitle label (Acronym or Category)
     nodeEnter
@@ -328,6 +587,10 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .attr('pointer-events', 'none')
       .style('font-family', 'sans-serif')
       .style('font-size', '9px')
+      .style('paint-order', 'stroke fill')
+      .style('stroke', '#020617')
+      .style('stroke-width', '2.5px')
+      .style('stroke-linejoin', 'round')
       .attr('fill', '#94a3b8');
 
     // Degree Badge circle
@@ -361,6 +624,22 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
 
       // Update node positions
       allNodes.attr('transform', (d) => `translate(${d.x || 0},${d.y || 0})`);
+
+      // Update midpoint link badges in focus view
+      g.select('.link-labels-layer')
+        .selectAll<SVGGElement, GraphLink>('g.focus-link-badge')
+        .attr('transform', (d: unknown) => {
+          const link = d as { source: { x?: number; y?: number }; target: { x?: number; y?: number } };
+          const sx = link.source?.x || 0;
+          const sy = link.source?.y || 0;
+          const tx = link.target?.x || 0;
+          const ty = link.target?.y || 0;
+          const mx = (sx + tx) / 2;
+          const my = (sy + ty) / 2;
+          const px = mx - (ty - sy) * 0.086;
+          const py = my + (tx - sx) * 0.086;
+          return `translate(${px}, ${py})`;
+        });
     });
 
     return () => {
@@ -368,19 +647,52 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     };
   }, [nodes, links, clusterMode]);
 
-  // Update styles, animated highlight effects, and interactions
+  // Update styles, animated highlight effects, Focus View, and interactions
   useEffect(() => {
     if (!gRef.current) return;
     const g = d3.select(gRef.current);
 
     const isActorSelected = !!selectedActor;
+    const isFocusMode = !!focusedActor;
 
-    // Style Links
+    // Attach canvas background double-click to exit Focus View
+    if (svgRef.current) {
+      d3.select(svgRef.current).on('dblclick', (event) => {
+        const targetTag = (event.target as Element)?.tagName?.toLowerCase();
+        if (targetTag === 'svg' || targetTag === 'rect') {
+          handleExitFocusView();
+        }
+      });
+    }
+
+    // 1. Style Links
     g.selectAll<SVGPathElement, GraphLink>('.graph-link')
-      .attr('stroke', (d) => RELATION_CONFIG[d.type]?.color || '#64748b')
+      .attr('stroke', (d) => {
+        if (isFocusMode) {
+          const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
+          const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
+          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
+          if (isFocalDirect) {
+            const layer = getLinkLayer(d.type);
+            return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
+          }
+          return '#334155';
+        }
+        return RELATION_CONFIG[d.type]?.color || '#64748b';
+      })
       .attr('stroke-width', (d) => {
         const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
         const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
+
+        if (isFocusMode) {
+          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
+          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
+          if (isFocalDirect && activeFocusNeighborIds.has(neighborId)) {
+            return Math.max(3.5, d.intensity * 1.35);
+          }
+          return 1;
+        }
+
         const isConnectedToSelected =
           isActorSelected && (srcId === selectedActor.id || tgtId === selectedActor.id);
 
@@ -392,11 +704,20 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .attr('stroke-dasharray', (d) => {
         const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
         const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
+
+        if (isFocusMode) {
+          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
+          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
+          if (isFocalDirect && activeFocusNeighborIds.has(neighborId)) {
+            return '8,4';
+          }
+          return 'none';
+        }
+
         const isConnectedToSelected =
           isActorSelected && (srcId === selectedActor.id || tgtId === selectedActor.id);
 
         if (isConnectedToSelected) {
-          // Flowing dashed stream for animated highlight
           return '8,4';
         }
         return RELATION_CONFIG[d.type]?.strokeDash || 'none';
@@ -405,6 +726,14 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .attr('class', (d) => {
         const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
         const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
+
+        if (isFocusMode) {
+          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
+          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
+          const isFlowing = isFocalDirect && activeFocusNeighborIds.has(neighborId);
+          return `graph-link cursor-pointer transition-opacity duration-200 ${isFlowing ? 'link-flowing' : ''}`;
+        }
+
         const isConnectedToSelected =
           isActorSelected && (srcId === selectedActor.id || tgtId === selectedActor.id);
 
@@ -415,6 +744,16 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .attr('opacity', (d) => {
         const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
         const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
+
+        // Focus View mode: Dim non-focused links heavily
+        if (isFocusMode) {
+          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
+          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
+          if (isFocalDirect && activeFocusNeighborIds.has(neighborId)) {
+            return 1;
+          }
+          return 0.02; // heavily dimmed
+        }
 
         // Path highlighting
         if (highlightedPathNodeIds.length >= 2) {
@@ -451,9 +790,78 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         setTooltipPos(null);
       });
 
-    // Style Nodes
+    // 2. Midpoint Link Badges in Focus View
+    const linkLabelsGroup = g.select<SVGGElement>('.link-labels-layer');
+    if (isFocusMode) {
+      const visibleLinks = focusedDirectLinks.filter((l) => {
+        const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
+        const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
+        const neighborId = srcId === focusedActor.id ? tgtId : srcId;
+        return activeFocusNeighborIds.has(neighborId);
+      });
+
+      const labelSelection = linkLabelsGroup
+        .selectAll<SVGGElement, GraphLink>('g.focus-link-badge')
+        .data(visibleLinks, (d: unknown) => (d as GraphLink).id);
+
+      labelSelection.exit().remove();
+
+      const labelEnter = labelSelection
+        .enter()
+        .append('g')
+        .attr('class', 'focus-link-badge pointer-events-none');
+
+      labelEnter
+        .append('rect')
+        .attr('rx', 6)
+        .attr('ry', 6)
+        .attr('height', 20)
+        .attr('y', -10);
+
+      labelEnter
+        .append('text')
+        .attr('text-anchor', 'middle')
+        .attr('dominant-baseline', 'central')
+        .style('font-family', 'Vazirmatn, sans-serif')
+        .style('font-size', '10px')
+        .style('font-weight', '600');
+
+      const allBadgeLabels = labelEnter.merge(labelSelection);
+
+      allBadgeLabels.each(function (datum: unknown) {
+        const d = datum as GraphLink;
+        const sel = d3.select(this);
+        const layer = getLinkLayer(d.type);
+        const layerCfg = STRATEGIC_LAYERS[layer];
+        const textStr = `${layerCfg.icon} ${d.typeFa} (${d.intensity}/5)`;
+
+        sel.select('text')
+          .text(textStr)
+          .attr('fill', '#f8fafc');
+
+        const textWidth = Math.max(90, d.typeFa.length * 8.5 + 45);
+        sel.select('rect')
+          .attr('width', textWidth)
+          .attr('x', -textWidth / 2)
+          .attr('fill', '#020617')
+          .attr('stroke', layerCfg.color)
+          .attr('stroke-width', 1.5)
+          .attr('opacity', 0.95);
+      });
+    } else {
+      linkLabelsGroup.selectAll('*').remove();
+    }
+
+    // 3. Style Nodes
     g.selectAll<SVGGElement, GraphNode & d3.SimulationNodeDatum>('g.node-group')
       .attr('opacity', (d) => {
+        // In Focus View: only focused actor and active neighbors have full opacity, rest are heavily dimmed
+        if (isFocusMode) {
+          if (d.id === focusedActor.id) return 1;
+          if (activeFocusNeighborIds.has(d.id)) return 1;
+          return 0.03; // heavily dimmed
+        }
+
         if (highlightedPathNodeIds.length > 0) {
           return highlightedPathNodeIds.includes(d.id) ? 1 : 0.1;
         }
@@ -473,6 +881,13 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         }
         return 1;
       })
+      .attr('pointer-events', (d) => {
+        if (isFocusMode) {
+          const isFocalOrNeighbor = d.id === focusedActor.id || activeFocusNeighborIds.has(d.id);
+          return isFocalOrNeighbor ? 'auto' : 'none';
+        }
+        return 'auto';
+      })
       .on('mouseenter', (event, d) => {
         setHoveredNodeId(d.id);
         const [x, y] = d3.pointer(event, containerRef.current);
@@ -485,39 +900,87 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .on('click', (_event, d) => {
         const fullActor = allActorsMap.get(d.id);
         if (fullActor) {
-          // Toggle selection: click same actor clears, click different actor selects
+          // In Focus View, clicking another actor highlights them
           onSelectActor(selectedActor?.id === d.id ? null : fullActor);
+        }
+      })
+      .on('dblclick', (event, d) => {
+        // Double click enters Focus View
+        event.stopPropagation();
+        event.preventDefault();
+        const fullActor = allActorsMap.get(d.id);
+        if (fullActor) {
+          handleEnterFocusView(fullActor);
         }
       });
 
-    // Animated Pulse Halo for Selected Node
+    // Animated Target Rings for Focused Node
+    g.selectAll<SVGCircleElement, GraphNode>('.node-focus-ring')
+      .attr('display', (d) => (isFocusMode && focusedActor.id === d.id ? 'block' : 'none'))
+      .attr('r', (d) => 28 + (d.influenceScore || 3) * 4.5);
+
+    g.selectAll<SVGCircleElement, GraphNode>('.focus-reticle')
+      .attr('display', (d) => (isFocusMode && focusedActor.id === d.id ? 'block' : 'none'))
+      .attr('r', (d) => 24 + (d.influenceScore || 3) * 4);
+
+    // Animated Pulse Halo for Selected Node (when not in Focus View)
     g.selectAll<SVGCircleElement, GraphNode>('.node-pulse-ring')
-      .attr('display', (d) => (selectedActor?.id === d.id ? 'block' : 'none'))
+      .attr('display', (d) => (!isFocusMode && selectedActor?.id === d.id ? 'block' : 'none'))
       .attr('r', (d) => 24 + (d.influenceScore || 3) * 4);
 
     // Animated Glowing Halo for Connected Neighbor Nodes
     g.selectAll<SVGCircleElement, GraphNode>('.node-neighbor-ring')
       .attr('display', (d) => {
+        if (isFocusMode) {
+          if (d.id === focusedActor.id) return 'none';
+          return activeFocusNeighborIds.has(d.id) ? 'block' : 'none';
+        }
         if (!isActorSelected || d.id === selectedActor.id) return 'none';
         return firstDegreeNeighbors.has(d.id) ? 'block' : 'none';
+      })
+      .attr('stroke', (d) => {
+        if (isFocusMode && activeFocusNeighborIds.has(d.id)) {
+          const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
+          return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
+        }
+        return '#38bdf8';
       })
       .attr('r', (d) => 20 + (d.influenceScore || 3) * 3.5);
 
     // Update Circle Sizes & Colors
     g.selectAll<SVGCircleElement, GraphNode>('.node-core')
-      .attr('r', (d) => 16 + (d.influenceScore || 3) * 3)
+      .attr('r', (d) => {
+        if (isFocusMode && focusedActor.id === d.id) {
+          return 22 + (d.influenceScore || 3) * 3;
+        }
+        return 16 + (d.influenceScore || 3) * 3;
+      })
       .attr('fill', (d) => {
+        if (isFocusMode && focusedActor.id === d.id) return '#ffffff';
         const isSelected = selectedActor?.id === d.id;
         const color = CATEGORY_COLORS[d.category]?.hex || '#3b82f6';
         return isSelected ? '#ffffff' : color;
       })
       .attr('stroke', (d) => {
+        if (isFocusMode) {
+          if (focusedActor.id === d.id) return '#38bdf8';
+          if (activeFocusNeighborIds.has(d.id)) {
+            const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
+            return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
+          }
+          return '#0f172a';
+        }
         const isSelected = selectedActor?.id === d.id;
         if (isSelected) return '#38bdf8';
         if (isActorSelected && firstDegreeNeighbors.has(d.id)) return '#38bdf8';
         return '#0f172a';
       })
       .attr('stroke-width', (d) => {
+        if (isFocusMode) {
+          if (focusedActor.id === d.id) return 4.5;
+          if (activeFocusNeighborIds.has(d.id)) return 3.5;
+          return 1.5;
+        }
         if (selectedActor?.id === d.id) return 4;
         if (isActorSelected && firstDegreeNeighbors.has(d.id)) return 2.5;
         return 2;
@@ -527,39 +990,84 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     g.selectAll<SVGCircleElement, GraphNode>('.node-ripple')
       .attr('r', (d) => 22 + (d.influenceScore || 3) * 4.5)
       .attr('stroke', (d) => CATEGORY_COLORS[d.category]?.hex || '#3b82f6')
-      .attr('display', showRipples ? 'block' : 'none');
+      .attr('display', (d) => {
+        if (isFocusMode) {
+          return focusedActor.id === d.id || activeFocusNeighborIds.has(d.id) ? 'block' : 'none';
+        }
+        return showRipples ? 'block' : 'none';
+      });
 
     // Update Icons/Flags
     g.selectAll<SVGTextElement, GraphNode>('.node-icon')
       .text((d) => d.flagEmoji || d.acronym || '★')
-      .attr('font-size', (d) => (d.flagEmoji ? '14px' : '10px'))
-      .attr('fill', (d) => (selectedActor?.id === d.id ? '#0f172a' : '#ffffff'));
+      .attr('font-size', (d) => (d.flagEmoji ? (isFocusMode && focusedActor.id === d.id ? '16px' : '14px') : '10px'))
+      .attr('fill', (d) => {
+        if (isFocusMode && focusedActor.id === d.id) return '#0f172a';
+        return selectedActor?.id === d.id ? '#0f172a' : '#ffffff';
+      });
 
     // Update Main Persian Labels
     g.selectAll<SVGTextElement, GraphNode>('.node-label')
-      .text((d) => d.nameFa)
+      .text((d) => {
+        if (isFocusMode && focusedActor.id === d.id) return `${d.nameFa} 🎯`;
+        return d.nameFa;
+      })
       .attr('y', (d) => 22 + (d.influenceScore || 3) * 3 + 12)
       .attr('fill', (d) => {
+        if (isFocusMode) {
+          if (focusedActor.id === d.id) return '#38bdf8';
+          if (activeFocusNeighborIds.has(d.id)) return '#f8fafc';
+          return '#64748b';
+        }
         if (selectedActor?.id === d.id) return '#38bdf8';
         if (isActorSelected && firstDegreeNeighbors.has(d.id)) return '#f8fafc';
         if (hoveredNodeId === d.id) return '#f8fafc';
         return '#cbd5e1';
       })
       .attr('font-weight', (d) => {
+        if (isFocusMode && (focusedActor.id === d.id || activeFocusNeighborIds.has(d.id))) return '800';
         if (selectedActor?.id === d.id || (isActorSelected && firstDegreeNeighbors.has(d.id))) return '700';
         return '600';
       })
-      .attr('font-size', (d) => (d.influenceScore >= 5 ? '12px' : '10.5px'))
-      .attr('display', showLabels ? 'block' : 'none');
+      .attr('font-size', (d) => {
+        if (isFocusMode && focusedActor.id === d.id) return '13px';
+        return d.influenceScore >= 5 ? '12px' : '10.5px';
+      });
 
-    // Update Sublabels (English/Acronym)
+    // Update Sublabels (English/Acronym or Strategic Layer in Focus View)
     g.selectAll<SVGTextElement, GraphNode>('.node-sublabel')
-      .text((d) => d.acronym || d.nameEn.slice(0, 18))
+      .text((d) => {
+        if (isFocusMode) {
+          if (focusedActor.id === d.id) return 'گره کانونی فوکوس (Focal Point)';
+          if (activeFocusNeighborIds.has(d.id)) {
+            const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
+            const layerCfg = STRATEGIC_LAYERS[layer];
+            return `${layerCfg.icon} ${layerCfg.nameFa}`;
+          }
+        }
+        return d.acronym || d.nameEn.slice(0, 18);
+      })
       .attr('y', (d) => 22 + (d.influenceScore || 3) * 3 + 24)
-      .attr('display', showLabels ? 'block' : 'none');
+      .attr('fill', (d) => {
+        if (isFocusMode) {
+          if (focusedActor.id === d.id) return '#38bdf8';
+          if (activeFocusNeighborIds.has(d.id)) {
+            const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
+            return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
+          }
+        }
+        return '#94a3b8';
+      })
+      .attr('font-weight', (d) => (isFocusMode && activeFocusNeighborIds.has(d.id) ? '600' : '400'));
 
     // Update Degree Badges
     g.selectAll<SVGGElement, GraphNode>('.degree-badge')
+      .attr('display', (d) => {
+        if (isFocusMode) {
+          return focusedActor.id === d.id || activeFocusNeighborIds.has(d.id) ? 'block' : 'none';
+        }
+        return 'block';
+      })
       .attr('transform', (d) => {
         const r = 16 + (d.influenceScore || 3) * 3;
         return `translate(${r * 0.72}, ${-r * 0.72})`;
@@ -567,7 +1075,17 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       .select('text')
       .text((d) => d.degree || 0);
 
+    // Apply Level of Detail (LOD) label display & styling for current zoom
+    applyLabelsLOD(currentZoomKRef.current);
+
   }, [
+    focusedActor,
+    focusLayer,
+    focusedDirectLinks,
+    focusedNeighborsMap,
+    activeFocusNeighborIds,
+    handleEnterFocusView,
+    handleExitFocusView,
     activeFocusId,
     connectedNeighbors,
     firstDegreeNeighbors,
@@ -575,7 +1093,8 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     hoveredNodeId,
     highlightedPathNodeIds,
     searchQuery,
-    showLabels,
+    labelDensityMode,
+    applyLabelsLOD,
     showRipples,
     expandToSecondDegree,
     allActorsMap,
@@ -685,8 +1204,8 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         </g>
       </svg>
 
-      {/* Floating Interactive Connection HUD (Displays upon Node Click) */}
-      {selectedActor && (
+      {/* Floating Interactive Connection HUD (Displays upon Node Click when NOT in Focus View) */}
+      {selectedActor && !focusedActor && (
         <div
           className="absolute top-4 right-4 z-30 bg-slate-900/95 backdrop-blur-xl border border-cyan-500/40 p-4 rounded-2xl shadow-2xl max-w-sm w-80 text-right font-vazir animate-in fade-in slide-in-from-top-2 duration-300"
           id="actor-connection-hud"
@@ -762,6 +1281,25 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
             )}
           </div>
 
+          {/* Quick Enter Focus View Banner */}
+          <div className="mb-3 p-2.5 bg-gradient-to-r from-cyan-950/60 to-blue-950/60 border border-cyan-500/30 rounded-xl flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-lg animate-pulse">🎯</span>
+              <div className="text-[11px]">
+                <p className="text-cyan-200 font-bold">دید متمرکز (Focus View)</p>
+                <p className="text-slate-400 text-[10px]">کمرنگ‌سازی سایر گره‌ها و تفکیک لایه‌ای</p>
+              </div>
+            </div>
+            <button
+              onClick={() => handleEnterFocusView(selectedActor)}
+              className="px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold transition-all shadow hover:shadow-cyan-500/25 flex items-center gap-1 shrink-0"
+              title="ورود به Focus View (یا دبل‌کلیک روی گره)"
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>ورود به فوکوس</span>
+            </button>
+          </div>
+
           {/* 2nd Degree Neighborhood Toggle */}
           <div className="flex items-center justify-between bg-slate-950/40 p-2 rounded-xl border border-slate-800/60 mb-3 text-xs">
             <span className="text-slate-400 text-[11px]">گسترش به شبکه درجه ۲:</span>
@@ -810,6 +1348,23 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         </div>
       )}
 
+      {/* Focus View Dedicated Interactive Overlay Panel */}
+      {focusedActor && (
+        <FocusViewOverlay
+          focusedActor={focusedActor}
+          directLinks={focusedDirectLinks}
+          allActorsMap={allActorsMap}
+          activeLayer={focusLayer}
+          onChangeLayer={setFocusLayer}
+          onExitFocusView={handleExitFocusView}
+          onCenterOnActor={handleCenterOnActor}
+          onSelectActorForFocus={(actor) => {
+            handleEnterFocusView(actor);
+          }}
+          onOpenDetailsModal={onOpenDetailsModal}
+        />
+      )}
+
       {/* Floating Canvas Controls */}
       <div 
         className="absolute top-4 left-4 flex flex-col gap-1.5 bg-slate-900/90 backdrop-blur-md border border-slate-800 p-1.5 rounded-xl shadow-2xl z-20"
@@ -848,16 +1403,49 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           <RotateCcw className="w-4 h-4" />
         </button>
         <div className="h-px bg-slate-800 my-1" />
+        {/* Label Density Mode Button (Intelligent LOD / All / None) */}
         <button
-          onClick={() => setShowLabels(!showLabels)}
-          className={`p-2 rounded-lg transition-colors ${
-            showLabels ? 'text-cyan-400 bg-cyan-950/40' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+          onClick={() => {
+            const nextMode: 'auto' | 'all' | 'none' =
+              labelDensityMode === 'auto' ? 'all' : labelDensityMode === 'all' ? 'none' : 'auto';
+            setLabelDensityMode(nextMode);
+          }}
+          className={`p-2 rounded-lg transition-colors relative flex items-center justify-center ${
+            labelDensityMode === 'auto'
+              ? 'text-cyan-400 bg-cyan-950/50 hover:bg-cyan-900/50'
+              : labelDensityMode === 'all'
+              ? 'text-emerald-400 bg-emerald-950/50 hover:bg-emerald-900/50'
+              : 'text-slate-500 hover:text-white hover:bg-slate-800'
           }`}
-          title={showLabels ? 'مخفی‌سازی برچسب‌ها' : 'نمایش برچسب‌ها'}
-          id="btn-toggle-labels"
+          title={
+            labelDensityMode === 'auto'
+              ? `تراکم هوشمند برچسب‌ها فعال (زوم: ${zoomScale}%) - در زوم‌اوت بازیگران کلیدی اولویت دارند. کلیک برای نمایش همه`
+              : labelDensityMode === 'all'
+              ? 'نمایش همه برچسب‌ها بدون فیلتر. کلیک برای مخفی‌سازی کامل'
+              : 'مخفی‌سازی کامل برچسب‌ها. کلیک برای بازگشت به تراکم خودکار'
+          }
+          id="btn-label-density"
         >
-          {showLabels ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+          {labelDensityMode === 'auto' ? (
+            <div className="relative flex items-center justify-center">
+              <Eye className="w-4 h-4" />
+              <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-cyan-400 shadow-sm shadow-cyan-400" />
+            </div>
+          ) : labelDensityMode === 'all' ? (
+            <Eye className="w-4 h-4" />
+          ) : (
+            <EyeOff className="w-4 h-4" />
+          )}
         </button>
+
+        {/* Zoom Scale Badge */}
+        <div
+          className="text-[9px] font-mono text-center text-slate-400 py-0.5 px-1 bg-slate-950/70 rounded border border-slate-800/80 select-none"
+          title={`مقیاس فعلی زوم: ${zoomScale}%`}
+        >
+          {zoomScale}%
+        </div>
+
         <button
           onClick={() => setShowRipples(!showRipples)}
           className={`p-2 rounded-lg transition-colors ${
@@ -870,9 +1458,9 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         </button>
       </div>
 
-      {/* Floating Status & Node Count Badge */}
+      {/* Floating Status & Node Count Badge (Floats safely above bottom timeline) */}
       <div 
-        className="absolute bottom-4 left-4 flex items-center gap-3 bg-slate-900/80 backdrop-blur-md border border-slate-800/80 px-3.5 py-2 rounded-lg text-xs text-slate-400 z-10 font-sans"
+        className="absolute bottom-20 left-4 flex items-center gap-3 bg-slate-900/90 backdrop-blur-md border border-slate-800/90 px-3.5 py-2 rounded-xl text-xs text-slate-400 z-10 font-sans shadow-xl"
         id="graph-status-bar"
       >
         <div className="flex items-center gap-1.5">
@@ -883,6 +1471,15 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         <div className="flex items-center gap-1.5">
           <span className="text-slate-200 font-medium">{links.length} رابطه ژئوپلیتیک</span>
         </div>
+        {labelDensityMode === 'auto' && (
+          <>
+            <span className="text-slate-600 hidden xl:inline">|</span>
+            <span className="text-cyan-400/90 font-vazir text-[11px] hidden xl:inline flex items-center gap-1">
+              <span>✨</span>
+              <span>تراکم هوشمند: اولویت به بازیگران راهبردی در زوم‌اوت</span>
+            </span>
+          </>
+        )}
         {selectedActor && (
           <>
             <span className="text-slate-600">|</span>
@@ -891,10 +1488,19 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
             </span>
           </>
         )}
+        {!focusedActor && (
+          <>
+            <span className="text-slate-600 hidden lg:inline">|</span>
+            <span className="text-cyan-400/80 font-vazir text-[11px] hidden lg:inline flex items-center gap-1">
+              <span>🎯</span>
+              <span>دبل‌کلیک روی گره = Focus View لایه‌بندی‌شده</span>
+            </span>
+          </>
+        )}
       </div>
 
       {/* Floating Node Hover Tooltip (Only if not clicked on node) */}
-      {activeHoveredActor && tooltipPos && !selectedActor && (
+      {activeHoveredActor && tooltipPos && !selectedActor && !focusedActor && (
         <div
           className="absolute z-40 pointer-events-none transform -translate-x-1/2 -translate-y-full mb-3 bg-slate-900/95 backdrop-blur-md border border-slate-700/80 p-3.5 rounded-xl shadow-2xl max-w-sm w-72 text-right transition-opacity duration-150"
           style={{ left: `${tooltipPos.x}px`, top: `${tooltipPos.y - 12}px` }}
@@ -911,8 +1517,8 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
             <span 
               className="text-[10px] px-2 py-0.5 rounded-full font-medium"
               style={{
-                backgroundColor: `${CATEGORY_COLORS[activeHoveredActor.category]?.hex}20`,
-                color: CATEGORY_COLORS[activeHoveredActor.category]?.hex,
+                backgroundColor: `${CATEGORY_COLORS[activeHoveredActor.category]?.hex || '#38bdf8'}20`,
+                color: CATEGORY_COLORS[activeHoveredActor.category]?.hex || '#38bdf8',
               }}
             >
               قدرت: {activeHoveredActor.influenceScore}/5
@@ -934,9 +1540,14 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
             </div>
           </div>
 
-          <div className="mt-2 pt-1.5 border-t border-slate-800 text-[10px] text-cyan-400 flex items-center justify-between">
-            <span>کلیک جهت هایلایت و بررسی شبکه روابط</span>
-            <span>{firstDegreeNeighbors.size} پیوند مستقیم</span>
+          <div className="mt-2 pt-1.5 border-t border-slate-800 text-[10px] text-cyan-400 flex flex-col gap-1">
+            <div className="flex items-center justify-between">
+              <span>کلیک: هایلایت روابط متصل</span>
+              <span>{firstDegreeNeighbors.size} پیوند</span>
+            </div>
+            <div className="text-amber-300/90 font-medium">
+              ⚡ دبل‌کلیک: ورود به Focus View لایه‌بندی‌شده
+            </div>
           </div>
         </div>
       )}

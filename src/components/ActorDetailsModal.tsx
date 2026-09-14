@@ -34,6 +34,8 @@ export const ActorDetailsModal: React.FC<ActorDetailsModalProps> = ({
   onSetPathStart,
   onSetPathEnd,
 }) => {
+  if (!actor) return null;
+
   const categoryConfig = CATEGORY_COLORS[actor.category];
 
   // Get direct relationships for this actor
