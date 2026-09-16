@@ -4,6 +4,24 @@ import { CATEGORY_COLORS, RELATION_CONFIG } from '../data';
 
 export type ThreeLayoutType = 'sphere' | 'force' | 'concentric' | 'plane';
 
+// Monochrome Palette for High-Tactical Aesthetic
+export const MONOCHROME_NODE_COLORS: { [score: number]: { color: string; emissive: string; halo: string } } = {
+  5: { color: '#f8fafc', emissive: '#cbd5e1', halo: '#e2e8f0' }, // Superpower Platinum White
+  4: { color: '#e2e8f0', emissive: '#94a3b8', halo: '#cbd5e1' }, // High Power Silver
+  3: { color: '#94a3b8', emissive: '#64748b', halo: '#94a3b8' }, // Medium Power Titanium
+  2: { color: '#64748b', emissive: '#475569', halo: '#64748b' }, // Low Power Steel
+  1: { color: '#475569', emissive: '#334155', halo: '#475569' }, // Minimal Power Dark Charcoal
+};
+
+export const MONOCHROME_RELATION_COLORS: { [type in RelationType]: string } = {
+  alliance: '#f8fafc',    // Solid Radiant Silver White
+  conflict: '#a1a1aa',    // Zinc Graphite (Contrast Dashed)
+  economic: '#e2e8f0',    // Luminous Platinum Trade Flow
+  diplomatic: '#cbd5e1',  // Silver Gray Channel
+  proxy_cyber: '#94a3b8', // Slate Titanium
+  volatile: '#71717a',    // Dark Zinc
+};
+
 export interface Node3DPosition {
   x: number;
   y: number;
@@ -194,7 +212,8 @@ export function compute3DLayout(
 export function createActorSpriteTexture(
   actor: GraphNode,
   isSelected: boolean,
-  isHovered: boolean
+  isHovered: boolean,
+  isMonochrome: boolean = true
 ): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d')!;
@@ -206,7 +225,9 @@ export function createActorSpriteTexture(
 
   // Background pill
   const catConfig = CATEGORY_COLORS[actor.category];
-  const catColor = catConfig?.hex || '#38bdf8';
+  const score = Math.max(1, Math.min(5, Math.round(actor.influenceScore || 3)));
+  const monoConfig = MONOCHROME_NODE_COLORS[score] || MONOCHROME_NODE_COLORS[3];
+  const catColor = isMonochrome ? monoConfig.color : (catConfig?.hex || '#38bdf8');
 
   ctx.clearRect(0, 0, width, height);
 
@@ -222,22 +243,22 @@ export function createActorSpriteTexture(
   ctx.roundRect(paddingX, paddingY, pillW, pillH, r);
 
   if (isSelected) {
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
-    ctx.strokeStyle = '#38bdf8';
+    ctx.fillStyle = isMonochrome ? 'rgba(15, 23, 42, 0.96)' : 'rgba(15, 23, 42, 0.92)';
+    ctx.strokeStyle = isMonochrome ? '#ffffff' : '#38bdf8';
     ctx.lineWidth = 4;
-    ctx.shadowColor = '#38bdf8';
+    ctx.shadowColor = isMonochrome ? '#ffffff' : '#38bdf8';
     ctx.shadowBlur = 18;
   } else if (isHovered) {
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+    ctx.fillStyle = isMonochrome ? 'rgba(24, 24, 27, 0.94)' : 'rgba(15, 23, 42, 0.9)';
     ctx.strokeStyle = catColor;
     ctx.lineWidth = 3;
     ctx.shadowColor = catColor;
     ctx.shadowBlur = 14;
   } else {
-    ctx.fillStyle = 'rgba(10, 15, 30, 0.82)';
-    ctx.strokeStyle = 'rgba(71, 85, 105, 0.5)';
+    ctx.fillStyle = isMonochrome ? 'rgba(9, 9, 11, 0.88)' : 'rgba(10, 15, 30, 0.82)';
+    ctx.strokeStyle = isMonochrome ? 'rgba(113, 113, 122, 0.45)' : 'rgba(71, 85, 105, 0.5)';
     ctx.lineWidth = 1.5;
-    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowColor = 'rgba(0,0,0,0.7)';
     ctx.shadowBlur = 8;
   }
 
@@ -259,10 +280,10 @@ export function createActorSpriteTexture(
   // Subtitle: English acronym / power rating
   ctx.font = '600 16px "SF Pro", system-ui, sans-serif';
   ctx.textAlign = 'right';
-  ctx.fillStyle = '#94a3b8';
+  ctx.fillStyle = isMonochrome ? '#a1a1aa' : '#94a3b8';
 
   const acronym = actor.acronym ? `(${actor.acronym})` : '';
-  const scoreBadge = `قدرت: ${actor.influenceScore || 3}/۵`;
+  const scoreBadge = `سطح نفوذ: ${score}/۵`;
   ctx.fillText(`${acronym} • ${scoreBadge}`, width - paddingX - 18, paddingY + pillH * 0.74);
 
   // Left status pill indicator
