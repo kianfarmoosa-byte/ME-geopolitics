@@ -1,27 +1,36 @@
 import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
-import * as d3 from 'd3';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GraphNode, GraphLink, ActorData, RelationType } from '../types';
 import { CATEGORY_COLORS, RELATION_CONFIG } from '../data';
 import { 
   FocusViewOverlay, 
-  STRATEGIC_LAYERS, 
   StrategicLayerType, 
   getLinkLayer 
 } from './FocusViewOverlay';
+import { GraphTooltip } from './GraphTooltip';
+import { 
+  compute3DLayout, 
+  createActorSpriteTexture, 
+  getLinkCurve, 
+  ThreeLayoutType, 
+  Node3DPosition 
+} from '../utils/threeGraphHelpers';
 import { 
   ZoomIn, 
   ZoomOut, 
   Maximize2, 
   RotateCcw, 
-  Sparkles, 
   Eye, 
   EyeOff, 
-  X,
-  Target,
-  FileText,
-  Network,
-  Share2,
-  Layers
+  Sparkles, 
+  Compass, 
+  CircleDot, 
+  Grid, 
+  Play, 
+  Pause,
+  Layers,
+  Activity
 } from 'lucide-react';
 
 interface GraphCanvasProps {
@@ -36,6 +45,14 @@ interface GraphCanvasProps {
   clusterMode?: 'free' | 'category';
 }
 
+interface ParticlePulse {
+  curve: THREE.QuadraticBezierCurve3;
+  progress: number;
+  speed: number;
+  color: THREE.Color;
+  mesh: THREE.Mesh;
+}
+
 export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   nodes,
   links,
@@ -48,46 +65,99 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   clusterMode = 'free',
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
-  const gRef = useRef<SVGGElement>(null);
-  const simulationRef = useRef<d3.Simulation<d3.SimulationNodeDatum, undefined> | null>(null);
-  const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  // Layout mode: 'sphere' (منظومه کروی), 'force' (فیزیک تعادلی), 'concentric' (مدارهای نفوذ), 'plane' (صفحه راهبردی)
+  const [layoutType, setLayoutType] = useState<ThreeLayoutType>('sphere');
+  const [isAutoRotate, setIsAutoRotate] = useState<boolean>(true);
+  const [labelDensityMode, setLabelDensityMode] = useState<'auto' | 'all' | 'none'>('auto');
+
+  // Tooltip & Hover state
+  const [hoveredActor, setHoveredActor] = useState<ActorData | null>(null);
   const [hoveredLink, setHoveredLink] = useState<GraphLink | null>(null);
   const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
-  
-  // Intelligent Label Density (LOD): 'auto' prioritizes influential actors at zoom-out, 'all' shows all, 'none' hides
-  const [labelDensityMode, setLabelDensityMode] = useState<'auto' | 'all' | 'none'>('auto');
-  const [zoomScale, setZoomScale] = useState<number>(100);
-  const currentZoomKRef = useRef<number>(1.0);
 
-  const [showRipples, setShowRipples] = useState(true);
-  const [expandToSecondDegree, setExpandToSecondDegree] = useState(false);
-
-  // Focus View State (Activated via Double-Click on any Node)
+  // Focus View State
   const [focusedActor, setFocusedActor] = useState<ActorData | null>(null);
   const [focusLayer, setFocusLayer] = useState<StrategicLayerType>('all');
   const isFocusMode = Boolean(focusedActor);
 
-  // Direct links connected to focusedActor
+  // References for Three.js engine
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
+  const animFrameIdRef = useRef<number | null>(null);
+
+  // 3D Objects Storage
+  const nodeMeshesRef = useRef<Map<string, {
+    group: THREE.Group;
+    sphere: THREE.Mesh;
+    halo?: THREE.Mesh;
+    sprite: THREE.Sprite;
+    baseScale: number;
+    colorHex: string;
+  }>>(new Map());
+
+  const linkObjectsRef = useRef<Map<string, {
+    line: THREE.Line;
+    curve: THREE.QuadraticBezierCurve3;
+    sourceId: string;
+    targetId: string;
+    baseColor: string;
+    baseWidth: number;
+    link: GraphLink;
+  }>>(new Map());
+
+  const pulsesRef = useRef<ParticlePulse[]>([]);
+  const nodePositionsRef = useRef<Map<string, Node3DPosition>>(new Map());
+
+  // Camera animation target
+  const targetCamPosRef = useRef<THREE.Vector3 | null>(null);
+  const targetLookAtRef = useRef<THREE.Vector3 | null>(null);
+
+  // Sync state refs for animation loop & event listeners
+  const selectedActorRef = useRef(selectedActor);
+  useEffect(() => { selectedActorRef.current = selectedActor; }, [selectedActor]);
+
+  const focusedActorRef = useRef(focusedActor);
+  useEffect(() => { focusedActorRef.current = focusedActor; }, [focusedActor]);
+
+  const allActorsMapRef = useRef(allActorsMap);
+  useEffect(() => { allActorsMapRef.current = allActorsMap; }, [allActorsMap]);
+
+  const linksRef = useRef(links);
+  useEffect(() => { linksRef.current = links; }, [links]);
+
+  const nodesRef = useRef(nodes);
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+
+  const onSelectActorRef = useRef(onSelectActor);
+  useEffect(() => { onSelectActorRef.current = onSelectActor; }, [onSelectActor]);
+
+  const highlightedPathNodeIdsRef = useRef(highlightedPathNodeIds);
+  useEffect(() => { highlightedPathNodeIdsRef.current = highlightedPathNodeIds; }, [highlightedPathNodeIds]);
+
+  const searchQueryRef = useRef(searchQuery);
+  useEffect(() => { searchQueryRef.current = searchQuery; }, [searchQuery]);
+
+  // Compute direct links & neighbors for focusedActor
   const focusedDirectLinks = useMemo(() => {
     if (!focusedActor) return [];
     return links.filter((l) => {
-      const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
-      const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
+      const srcId = typeof l.source === 'object' ? (l.source as { id: string }).id : l.source;
+      const tgtId = typeof l.target === 'object' ? (l.target as { id: string }).id : l.target;
       return srcId === focusedActor.id || tgtId === focusedActor.id;
     });
   }, [focusedActor, links]);
 
-  // Neighbor lookup map for focused actor with layer categorization
   const focusedNeighborsMap = useMemo(() => {
     if (!focusedActor) return new Map<string, { neighbor: ActorData; links: GraphLink[]; layer: StrategicLayerType }>();
     const map = new Map<string, { neighbor: ActorData; links: GraphLink[]; layer: StrategicLayerType }>();
 
     focusedDirectLinks.forEach((l) => {
-      const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
-      const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
+      const srcId = typeof l.source === 'object' ? (l.source as { id: string }).id : l.source;
+      const tgtId = typeof l.target === 'object' ? (l.target as { id: string }).id : l.target;
       const neighborId = srcId === focusedActor.id ? tgtId : srcId;
       const neighbor = allActorsMap.get(neighborId);
       if (!neighbor) return;
@@ -103,1473 +173,905 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     return map;
   }, [focusedActor, focusedDirectLinks, allActorsMap]);
 
-  // Set of neighbor IDs that match current focusLayer
-  const activeFocusNeighborIds = useMemo(() => {
-    if (!focusedActor) return new Set<string>();
-    const set = new Set<string>();
-    focusedNeighborsMap.forEach((entry, id) => {
-      if (focusLayer === 'all' || entry.links.some((l) => getLinkLayer(l.type) === focusLayer)) {
-        set.add(id);
-      }
-    });
-    return set;
-  }, [focusedActor, focusedNeighborsMap, focusLayer]);
-
-  // Focus View entry handler: sets focal actor, resets layer, and smoothly centers camera
+  // Handle entering Focus View (Fly to actor in 3D)
   const handleEnterFocusView = useCallback((actor: ActorData) => {
     setFocusedActor(actor);
     onSelectActor(actor);
     setFocusLayer('all');
 
-    if (svgRef.current && zoomBehaviorRef.current && containerRef.current) {
-      const nodeEl = nodes.find((n) => n.id === actor.id);
-      if (nodeEl && nodeEl.x !== undefined && nodeEl.y !== undefined) {
-        const width = containerRef.current.clientWidth;
-        const height = containerRef.current.clientHeight;
-
-        d3.select(svgRef.current)
-          .transition()
-          .duration(750)
-          .ease(d3.easeCubicOut)
-          .call(
-            zoomBehaviorRef.current.transform,
-            d3.zoomIdentity
-              .translate(width / 2, height / 2)
-              .scale(1.55)
-              .translate(-nodeEl.x, -nodeEl.y)
-          );
-      }
+    const pos = nodePositionsRef.current.get(actor.id);
+    if (pos && cameraRef.current && controlsRef.current) {
+      const targetVec = new THREE.Vector3(pos.x, pos.y, pos.z);
+      const camOffset = new THREE.Vector3(pos.x, pos.y, pos.z).normalize().multiplyScalar(280);
+      if (camOffset.lengthSq() < 10) camOffset.set(0, 80, 260);
+      targetCamPosRef.current = targetVec.clone().add(camOffset);
+      targetLookAtRef.current = targetVec;
     }
-  }, [nodes, onSelectActor]);
+  }, [onSelectActor]);
 
-  // Focus View exit handler: clears focus and resets zoom smoothly
+  // Handle exiting Focus View
   const handleExitFocusView = useCallback(() => {
     setFocusedActor(null);
     setFocusLayer('all');
-    if (svgRef.current && zoomBehaviorRef.current && containerRef.current) {
-      const width = containerRef.current.clientWidth;
-      const height = containerRef.current.clientHeight;
-
-      d3.select(svgRef.current)
-        .transition()
-        .duration(600)
-        .call(
-          zoomBehaviorRef.current.transform,
-          d3.zoomIdentity
-            .translate(width / 2, height / 2)
-            .scale(0.85)
-            .translate(-width / 2, -height / 2)
-        );
-    }
+    targetCamPosRef.current = new THREE.Vector3(0, 240, 880);
+    targetLookAtRef.current = new THREE.Vector3(0, 0, 0);
   }, []);
 
-  // Compute connected nodes for hovered or selected node
-  const activeFocusId = selectedActor?.id || hoveredNodeId || null;
+  // Compute 3D node positions when nodes/links/layout changes
+  useEffect(() => {
+    const computedPositions = compute3DLayout(nodes, links, layoutType, allActorsMap);
+    nodePositionsRef.current = computedPositions;
 
-  // 1st-degree connected neighbors
-  const firstDegreeNeighbors = useMemo(() => {
-    if (!activeFocusId) return new Set<string>();
-    const set = new Set<string>();
-    links.forEach((l) => {
-      const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
-      const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
-      if (srcId === activeFocusId) set.add(tgtId);
-      if (tgtId === activeFocusId) set.add(srcId);
-    });
-    return set;
-  }, [activeFocusId, links]);
-
-  // 2nd-degree connected neighbors (if enabled)
-  const secondDegreeNeighbors = useMemo(() => {
-    if (!activeFocusId || !expandToSecondDegree) return new Set<string>();
-    const set = new Set<string>();
-    firstDegreeNeighbors.forEach((neighborId) => {
-      links.forEach((l) => {
-        const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
-        const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
-        if (srcId === neighborId && tgtId !== activeFocusId) set.add(tgtId);
-        if (tgtId === neighborId && srcId !== activeFocusId) set.add(srcId);
-      });
-    });
-    return set;
-  }, [activeFocusId, expandToSecondDegree, firstDegreeNeighbors, links]);
-
-  // All active connected neighbors
-  const connectedNeighbors = useMemo(() => {
-    if (!activeFocusId) return new Set<string>();
-    const combined = new Set<string>([activeFocusId, ...Array.from(firstDegreeNeighbors)]);
-    if (expandToSecondDegree) {
-      secondDegreeNeighbors.forEach((id) => combined.add(id));
-    }
-    return combined;
-  }, [activeFocusId, firstDegreeNeighbors, secondDegreeNeighbors, expandToSecondDegree]);
-
-  // Relationship breakdown for selected actor
-  const selectedActorLinkBreakdown = useMemo(() => {
-    if (!selectedActor) return null;
-    let alliances = 0;
-    let conflicts = 0;
-    let economic = 0;
-    let diplomatic = 0;
-    let proxy = 0;
-    let volatile = 0;
-
-    links.forEach((l) => {
-      const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
-      const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
-      if (srcId === selectedActor.id || tgtId === selectedActor.id) {
-        if (l.type === 'alliance') alliances++;
-        else if (l.type === 'conflict') conflicts++;
-        else if (l.type === 'economic') economic++;
-        else if (l.type === 'diplomatic') diplomatic++;
-        else if (l.type === 'proxy_cyber') proxy++;
-        else if (l.type === 'volatile') volatile++;
+    // Reposition node meshes
+    computedPositions.forEach((pos, id) => {
+      const nodeObj = nodeMeshesRef.current.get(id);
+      if (nodeObj) {
+        nodeObj.group.position.set(pos.x, pos.y, pos.z);
       }
     });
 
-    return { alliances, conflicts, economic, diplomatic, proxy, volatile };
-  }, [selectedActor, links]);
+    // Rebuild links with new curves
+    linkObjectsRef.current.forEach((edgeObj, linkId) => {
+      const sPos = computedPositions.get(edgeObj.sourceId);
+      const tPos = computedPositions.get(edgeObj.targetId);
+      if (sPos && tPos) {
+        const newCurve = getLinkCurve(sPos, tPos, edgeObj.link.intensity);
+        edgeObj.curve = newCurve;
+        const pts = newCurve.getPoints(32);
+        edgeObj.line.geometry.dispose();
+        edgeObj.line.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+      }
+    });
 
-  // Keyboard shortcut: Esc to clear focus or selection
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (focusedActor) {
-          handleExitFocusView();
-        } else if (selectedActor) {
-          onSelectActor(null);
+    // Update pulses
+    pulsesRef.current.forEach((p, idx) => {
+      const link = links[idx % Math.max(1, links.length)];
+      if (link) {
+        const sId = typeof link.source === 'object' ? (link.source as { id: string }).id : link.source;
+        const tId = typeof link.target === 'object' ? (link.target as { id: string }).id : link.target;
+        const sPos = computedPositions.get(sId);
+        const tPos = computedPositions.get(tId);
+        if (sPos && tPos) {
+          p.curve = getLinkCurve(sPos, tPos, link.intensity);
         }
       }
+    });
+  }, [nodes, links, layoutType, allActorsMap]);
+
+  // Main Three.js Scene Setup & Animation Loop
+  useEffect(() => {
+    if (!canvasRef.current || !containerRef.current) return;
+
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    const width = container.clientWidth || 800;
+    const height = container.clientHeight || 600;
+
+    // 1. Scene
+    const scene = new THREE.Scene();
+    sceneRef.current = scene;
+    scene.background = new THREE.Color(0x030712); // Deep Obsidian
+    scene.fog = new THREE.FogExp2(0x030712, 0.00065);
+
+    // 2. Camera
+    const camera = new THREE.PerspectiveCamera(52, width / height, 5, 5000);
+    camera.position.set(0, 240, 880);
+    cameraRef.current = camera;
+
+    // 3. Renderer
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      alpha: true,
+      powerPreference: 'high-performance',
+    });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.15;
+    rendererRef.current = renderer;
+
+    // 4. OrbitControls
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.minDistance = 140;
+    controls.maxDistance = 2200;
+    controls.autoRotate = isAutoRotate;
+    controls.autoRotateSpeed = 0.45;
+    controlsRef.current = controls;
+
+    // 5. Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
+    scene.add(ambientLight);
+
+    const dirLight1 = new THREE.DirectionalLight(0x38bdf8, 1.8);
+    dirLight1.position.set(400, 600, 500);
+    scene.add(dirLight1);
+
+    const dirLight2 = new THREE.DirectionalLight(0xa855f7, 1.2);
+    dirLight2.position.set(-500, -300, -400);
+    scene.add(dirLight2);
+
+    const pointLight = new THREE.PointLight(0x38bdf8, 2.0, 1400);
+    pointLight.position.set(0, 0, 0);
+    scene.add(pointLight);
+
+    // 6. Tactical Starfield / Dust Background Particles
+    const starCount = 650;
+    const starGeometry = new THREE.BufferGeometry();
+    const starPositions = new Float32Array(starCount * 3);
+    const starColors = new Float32Array(starCount * 3);
+
+    for (let i = 0; i < starCount; i++) {
+      starPositions[i * 3] = (Math.random() - 0.5) * 3200;
+      starPositions[i * 3 + 1] = (Math.random() - 0.5) * 2400;
+      starPositions[i * 3 + 2] = (Math.random() - 0.5) * 3200;
+
+      // Soft cyan / lavender tint
+      starColors[i * 3] = 0.4 + Math.random() * 0.4;
+      starColors[i * 3 + 1] = 0.6 + Math.random() * 0.4;
+      starColors[i * 3 + 2] = 0.9 + Math.random() * 0.1;
+    }
+
+    starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+    starGeometry.setAttribute('color', new THREE.BufferAttribute(starColors, 3));
+
+    const starMaterial = new THREE.PointsMaterial({
+      size: 2.2,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.5,
+      blending: THREE.AdditiveBlending,
+    });
+    const starField = new THREE.Points(starGeometry, starMaterial);
+    scene.add(starField);
+
+    // 7. Tactical Circular Coordinate Rings in Core
+    const ringGroup = new THREE.Group();
+    [240, 420, 600].forEach((radius) => {
+      const ringGeo = new THREE.RingGeometry(radius - 0.75, radius + 0.75, 64);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: 0x1e293b,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.35,
+      });
+      const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+      ringMesh.rotation.x = Math.PI / 2;
+      ringGroup.add(ringMesh);
+    });
+    scene.add(ringGroup);
+
+    // 8. Shared Geometries for Particle Pulses
+    const pulseGeo = new THREE.SphereGeometry(2.6, 12, 12);
+    const pulseMeshes: ParticlePulse[] = [];
+
+    // Create 18 active traveling energy pulses
+    const initialLinks = linksRef.current;
+    const pulseCount = Math.min(22, Math.max(10, initialLinks.length));
+    for (let i = 0; i < pulseCount; i++) {
+      const link = initialLinks[i % Math.max(1, initialLinks.length)];
+      if (!link) continue;
+      const relConfig = RELATION_CONFIG[link.type];
+      const pColor = new THREE.Color(relConfig?.color || '#38bdf8');
+
+      const pMat = new THREE.MeshBasicMaterial({
+        color: pColor,
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+      });
+      const pMesh = new THREE.Mesh(pulseGeo, pMat);
+      scene.add(pMesh);
+
+      // Dummy initial curve, will update
+      const dummyCurve = new THREE.QuadraticBezierCurve3(
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0, 50, 0),
+        new THREE.Vector3(0, 100, 0)
+      );
+
+      pulseMeshes.push({
+        curve: dummyCurve,
+        progress: (i / pulseCount),
+        speed: 0.0035 + Math.random() * 0.003,
+        color: pColor,
+        mesh: pMesh,
+      });
+    }
+    pulsesRef.current = pulseMeshes;
+
+    // 9. Resize Observer
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width: newW, height: newH } = entry.contentRect;
+        if (newW > 0 && newH > 0) {
+          camera.aspect = newW / newH;
+          camera.updateProjectionMatrix();
+          renderer.setSize(newW, newH);
+        }
+      }
+    });
+    resizeObserver.observe(container);
+
+    // 10. Animation Loop
+    let clock = new THREE.Clock();
+
+    const animate = () => {
+      animFrameIdRef.current = requestAnimationFrame(animate);
+      const delta = clock.getDelta();
+      const elapsedTime = clock.getElapsedTime();
+
+      // Smooth camera interpolation towards target
+      if (targetCamPosRef.current && targetLookAtRef.current) {
+        camera.position.lerp(targetCamPosRef.current, 0.06);
+        controls.target.lerp(targetLookAtRef.current, 0.06);
+
+        if (camera.position.distanceTo(targetCamPosRef.current) < 3) {
+          targetCamPosRef.current = null;
+          targetLookAtRef.current = null;
+        }
+      }
+
+      // Update controls
+      controls.update();
+
+      // Slowly rotate starfield & core rings for ambient space movement
+      starField.rotation.y = elapsedTime * 0.015;
+      ringGroup.rotation.y = -elapsedTime * 0.02;
+
+      // Animate pulses along edge curves
+      pulsesRef.current.forEach((pulse) => {
+        pulse.progress += pulse.speed;
+        if (pulse.progress > 1) pulse.progress = 0;
+        try {
+          const pt = pulse.curve.getPoint(pulse.progress);
+          pulse.mesh.position.copy(pt);
+        } catch {
+          // ignore
+        }
+      });
+
+      // Animate halos on superpower nodes
+      nodeMeshesRef.current.forEach(({ halo, sphere }) => {
+        if (halo) {
+          halo.rotation.z = elapsedTime * 0.8;
+          const scale = 1 + Math.sin(elapsedTime * 3) * 0.06;
+          halo.scale.set(scale, scale, 1);
+        }
+      });
+
+      renderer.render(scene, camera);
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [focusedActor, selectedActor, handleExitFocusView, onSelectActor]);
 
-  // Synchronized refs to avoid stale closures in high-frequency D3 zoom callbacks
-  const labelDensityModeRef = useRef<'auto' | 'all' | 'none'>('auto');
-  labelDensityModeRef.current = labelDensityMode;
-
-  const isFocusModeRef = useRef(isFocusMode);
-  isFocusModeRef.current = isFocusMode;
-
-  const focusedActorRef = useRef(focusedActor);
-  focusedActorRef.current = focusedActor;
-
-  const activeFocusNeighborIdsRef = useRef(activeFocusNeighborIds);
-  activeFocusNeighborIdsRef.current = activeFocusNeighborIds;
-
-  const selectedActorRef = useRef(selectedActor);
-  selectedActorRef.current = selectedActor;
-
-  const hoveredNodeIdRef = useRef(hoveredNodeId);
-  hoveredNodeIdRef.current = hoveredNodeId;
-
-  const firstDegreeNeighborsRef = useRef(firstDegreeNeighbors);
-  firstDegreeNeighborsRef.current = firstDegreeNeighbors;
-
-  const highlightedPathNodeIdsRef = useRef(highlightedPathNodeIds);
-  highlightedPathNodeIdsRef.current = highlightedPathNodeIds;
-
-  // Level-of-Detail (LOD) function to adaptively balance label visibility
-  // Prioritizes influential actors (influenceScore 4 and 5) and selected nodes when zoomed out
-  const applyLabelsLOD = useCallback((kVal?: number) => {
-    if (!gRef.current) return;
-    const k = kVal ?? currentZoomKRef.current;
-    const mode = labelDensityModeRef.current;
-    const inFocus = isFocusModeRef.current;
-    const fActor = focusedActorRef.current;
-    const fNeighbors = activeFocusNeighborIdsRef.current;
-    const selActor = selectedActorRef.current;
-    const hovId = hoveredNodeIdRef.current;
-    const directNeighbors = firstDegreeNeighborsRef.current;
-    const pathNodes = highlightedPathNodeIdsRef.current;
-
-    const g = d3.select(gRef.current);
-
-    // Update Persian main labels
-    g.selectAll<SVGTextElement, GraphNode>('.node-label')
-      .attr('display', (d) => {
-        // Focus view: only focal actor and active neighbors
-        if (inFocus && fActor) {
-          return fActor.id === d.id || fNeighbors.has(d.id) ? 'block' : 'none';
-        }
-
-        if (mode === 'none') return 'none';
-        if (mode === 'all') return 'block';
-
-        // Auto LOD mode:
-        // Priority 1: User interaction targets (selected, hovered, in path) ALWAYS show
-        if (selActor?.id === d.id || hovId === d.id || (pathNodes && pathNodes.includes(d.id))) {
-          return 'block';
-        }
-
-        // Priority 2: Direct 1st-degree neighbors of selected actor ALWAYS show
-        if (selActor && directNeighbors.has(d.id)) {
-          return 'block';
-        }
-
-        // Priority 3: Zoom level and influence score / degree hierarchy
-        const inf = d.influenceScore || 3;
-        const deg = d.degree || 0;
-
-        // Close-up view (k >= 1.25): Display all labels comfortably
-        if (k >= 1.25) return 'block';
-
-        // Standard 1:1 view (0.95 <= k < 1.25): Show actors with influence >= 3 or degree >= 2
-        if (k >= 0.95) return inf >= 3 || deg >= 2 ? 'block' : 'none';
-
-        // Moderate zoom-out (0.70 <= k < 0.95): Show actors with influence >= 4 or degree >= 3
-        if (k >= 0.70) return inf >= 4 || deg >= 3 ? 'block' : 'none';
-
-        // Deep zoom-out (0.45 <= k < 0.70): Show top regional powers (influence >= 5 or degree >= 5)
-        if (k >= 0.45) return inf >= 5 || deg >= 5 ? 'block' : 'none';
-
-        // Macro bird's-eye view (k < 0.45): Show only top strategic core actors (influence 5 and degree >= 2)
-        return inf >= 5 && deg >= 2 ? 'block' : 'none';
-      })
-      .attr('font-size', (d) => {
-        if (inFocus && fActor?.id === d.id) return '13px';
-        if (k < 0.75 && (d.influenceScore >= 5 || selActor?.id === d.id)) {
-          return '12px'; // Maintain crisp visibility for key hegemons when zoomed out
-        }
-        return d.influenceScore >= 5 ? '12px' : '10.5px';
-      })
-      .attr('font-weight', (d) => {
-        if (inFocus && (fActor?.id === d.id || fNeighbors.has(d.id))) return '800';
-        if (selActor?.id === d.id || (selActor && directNeighbors.has(d.id))) return '700';
-        if (k < 0.8 && d.influenceScore >= 5) return '800';
-        return '600';
-      });
-
-    // Update English / secondary sublabels
-    g.selectAll<SVGTextElement, GraphNode>('.node-sublabel')
-      .attr('display', (d) => {
-        if (inFocus && fActor) {
-          return fActor.id === d.id || fNeighbors.has(d.id) ? 'block' : 'none';
-        }
-
-        if (mode === 'none') return 'none';
-        if (mode === 'all') return 'block';
-
-        // Always show for hovered/selected
-        if (selActor?.id === d.id || hovId === d.id) return 'block';
-
-        // When zoomed out (k < 0.95), hide all sublabels to avoid vertical clutter
-        if (k < 0.95) return 'none';
-
-        return d.influenceScore >= 3 ? 'block' : 'none';
-      });
-  }, []);
-
-  // Set up D3 simulation
-  useEffect(() => {
-    if (!svgRef.current || !containerRef.current || nodes.length === 0) return;
-
-    const width = containerRef.current.clientWidth || 900;
-    const height = containerRef.current.clientHeight || 700;
-
-    // Clone data to avoid mutation issues in React 19
-    const simNodes: (GraphNode & d3.SimulationNodeDatum)[] = nodes.map((d) => ({ ...d }));
-    const simLinks: (d3.SimulationLinkDatum<d3.SimulationNodeDatum> & GraphLink)[] = links.map((l) => ({
-      ...l,
-      source: l.source,
-      target: l.target,
-    }));
-
-    // Group center targets for cluster mode
-    const categoryAngles: Record<string, { x: number; y: number }> = {};
-    const categories = Object.keys(CATEGORY_COLORS);
-    const radius = Math.min(width, height) * 0.32;
-    categories.forEach((cat, idx) => {
-      const angle = (idx / categories.length) * 2 * Math.PI - Math.PI / 2;
-      categoryAngles[cat] = {
-        x: width / 2 + radius * Math.cos(angle),
-        y: height / 2 + radius * Math.sin(angle),
-      };
-    });
-
-    // Create D3 Force Simulation
-    const simulation = d3
-      .forceSimulation(simNodes as d3.SimulationNodeDatum[])
-      .force(
-        'link',
-        d3
-          .forceLink(simLinks)
-          .id((d) => (d as GraphNode).id)
-          .distance((d) => {
-            const link = d as unknown as GraphLink;
-            return 85 + (5 - (link.intensity || 3)) * 25;
-          })
-          .strength(0.4)
-      )
-      .force(
-        'charge',
-        d3.forceManyBody().strength((d) => {
-          const node = d as unknown as GraphNode;
-          return -140 - (node.influenceScore || 3) * 35;
-        })
-      )
-      .force(
-        'collision',
-        d3.forceCollide().radius((d) => {
-          const node = d as unknown as GraphNode;
-          return 28 + (node.influenceScore || 3) * 5;
-        })
-      )
-      .force('center', d3.forceCenter(width / 2, height / 2).strength(0.08));
-
-    // Optional cluster positioning
-    if (clusterMode === 'category') {
-      simulation.force(
-        'clusterX',
-        d3.forceX((d) => {
-          const node = d as unknown as GraphNode;
-          return categoryAngles[node.category]?.x || width / 2;
-        }).strength(0.35)
-      );
-      simulation.force(
-        'clusterY',
-        d3.forceY((d) => {
-          const node = d as unknown as GraphNode;
-          return categoryAngles[node.category]?.y || height / 2;
-        }).strength(0.35)
-      );
-    }
-
-    simulationRef.current = simulation;
-
-    // SVG elements setup
-    const svg = d3.select(svgRef.current);
-    const g = d3.select(gRef.current);
-
-    // Zoom setup
-    const zoom = d3
-      .zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.15, 4])
-      .on('zoom', (event) => {
-        g.attr('transform', event.transform);
-        currentZoomKRef.current = event.transform.k;
-        applyLabelsLOD(event.transform.k);
-      })
-      .on('end', (event) => {
-        setZoomScale(Math.round(event.transform.k * 100));
-      });
-
-    svg.call(zoom).on('dblclick.zoom', null);
-    zoomBehaviorRef.current = zoom;
-
-    // Drag setup
-    const drag = d3
-      .drag<SVGGElement, GraphNode & d3.SimulationNodeDatum>()
-      .on('start', (event, d) => {
-        if (!event.active) simulation.alphaTarget(0.3).restart();
-        d.fx = d.x;
-        d.fy = d.y;
-      })
-      .on('drag', (event, d) => {
-        d.fx = event.x;
-        d.fy = event.y;
-      })
-      .on('end', (event, d) => {
-        if (!event.active) simulation.alphaTarget(0);
-        d.fx = null;
-        d.fy = null;
-      });
-
-    // Draw Links
-    const linkSelection = g
-      .select<SVGGElement>('.links-layer')
-      .selectAll<SVGPathElement, GraphLink>('.graph-link')
-      .data(simLinks, (d) => d.id);
-
-    linkSelection.exit().remove();
-
-    const linkEnter = linkSelection
-      .enter()
-      .append('path')
-      .attr('class', 'graph-link cursor-pointer transition-opacity duration-200')
-      .attr('fill', 'none');
-
-    const allLinks = linkEnter.merge(linkSelection);
-
-    // Draw Nodes
-    const nodeSelection = g
-      .select<SVGGElement>('.nodes-layer')
-      .selectAll<SVGGElement, GraphNode & d3.SimulationNodeDatum>('g.node-group')
-      .data(simNodes, (d) => d.id);
-
-    nodeSelection.exit().remove();
-
-    const nodeEnter = nodeSelection
-      .enter()
-      .append('g')
-      .attr('class', 'node-group cursor-pointer select-none')
-      .call(drag as unknown as (selection: d3.Selection<SVGGElement, GraphNode & d3.SimulationNodeDatum, SVGGElement, unknown>) => void);
-
-    // Focus View Pulsing Target Ring (visible in Focus View on focal node)
-    nodeEnter
-      .append('circle')
-      .attr('class', 'node-focus-ring')
-      .attr('fill', 'none')
-      .attr('stroke', '#38bdf8')
-      .attr('display', 'none')
-      .attr('pointer-events', 'none');
-
-    // Focus View Reticle (dashed target ring around focal node)
-    nodeEnter
-      .append('circle')
-      .attr('class', 'focus-reticle')
-      .attr('fill', 'none')
-      .attr('stroke', '#06b6d4')
-      .attr('stroke-width', 1.5)
-      .attr('stroke-dasharray', '5,4')
-      .attr('display', 'none')
-      .attr('pointer-events', 'none');
-
-    // Animated Pulse Ring (visible only when clicked/selected)
-    nodeEnter
-      .append('circle')
-      .attr('class', 'node-pulse-ring')
-      .attr('fill', 'none')
-      .attr('stroke', '#38bdf8')
-      .attr('display', 'none')
-      .attr('pointer-events', 'none');
-
-    // Animated Neighbor Glow Ring (visible when connected to selected actor)
-    nodeEnter
-      .append('circle')
-      .attr('class', 'node-neighbor-ring')
-      .attr('fill', 'none')
-      .attr('display', 'none')
-      .attr('pointer-events', 'none');
-
-    // Node outer ripple circle
-    nodeEnter
-      .append('circle')
-      .attr('class', 'node-ripple')
-      .attr('fill', 'none')
-      .attr('stroke-width', 1.5)
-      .attr('opacity', 0.25);
-
-    // Node main circle
-    nodeEnter
-      .append('circle')
-      .attr('class', 'node-core')
-      .attr('stroke-width', 2.5);
-
-    // Flag emoji or initials text
-    nodeEnter
-      .append('text')
-      .attr('class', 'node-icon')
-      .attr('text-anchor', 'middle')
-      .attr('dominant-baseline', 'central')
-      .attr('pointer-events', 'none')
-      .style('font-family', 'sans-serif');
-
-    // Persian text label
-    nodeEnter
-      .append('text')
-      .attr('class', 'node-label')
-      .attr('text-anchor', 'middle')
-      .attr('pointer-events', 'none')
-      .style('font-family', 'Vazirmatn, sans-serif')
-      .style('font-weight', '600')
-      .style('paint-order', 'stroke fill')
-      .style('stroke', '#020617')
-      .style('stroke-width', '3.5px')
-      .style('stroke-linejoin', 'round');
-
-    // Subtitle label (Acronym or Category)
-    nodeEnter
-      .append('text')
-      .attr('class', 'node-sublabel')
-      .attr('text-anchor', 'middle')
-      .attr('pointer-events', 'none')
-      .style('font-family', 'sans-serif')
-      .style('font-size', '9px')
-      .style('paint-order', 'stroke fill')
-      .style('stroke', '#020617')
-      .style('stroke-width', '2.5px')
-      .style('stroke-linejoin', 'round')
-      .attr('fill', '#94a3b8');
-
-    // Degree Badge circle
-    const badgeGroup = nodeEnter.append('g').attr('class', 'degree-badge');
-    badgeGroup.append('circle').attr('r', 8).attr('fill', '#0f172a').attr('stroke', '#475569').attr('stroke-width', 1);
-    badgeGroup
-      .append('text')
-      .attr('text-anchor', 'middle')
-      .attr('dominant-baseline', 'central')
-      .attr('fill', '#f8fafc')
-      .style('font-size', '8px')
-      .style('font-family', 'sans-serif')
-      .style('font-weight', '700');
-
-    const allNodes = nodeEnter.merge(nodeSelection);
-
-    // Simulation tick loop
-    simulation.on('tick', () => {
-      // Curved paths for links
-      allLinks.attr('d', (d: unknown) => {
-        const link = d as { source: { x: number; y: number }; target: { x: number; y: number } };
-        const sx = link.source.x;
-        const sy = link.source.y;
-        const tx = link.target.x;
-        const ty = link.target.y;
-        const dx = tx - sx;
-        const dy = ty - sy;
-        const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
-        return `M${sx},${sy}A${dr},${dr} 0 0,1 ${tx},${ty}`;
-      });
-
-      // Update node positions
-      allNodes.attr('transform', (d) => `translate(${d.x || 0},${d.y || 0})`);
-
-      // Update midpoint link badges in focus view
-      g.select('.link-labels-layer')
-        .selectAll<SVGGElement, GraphLink>('g.focus-link-badge')
-        .attr('transform', (d: unknown) => {
-          const link = d as { source: { x?: number; y?: number }; target: { x?: number; y?: number } };
-          const sx = link.source?.x || 0;
-          const sy = link.source?.y || 0;
-          const tx = link.target?.x || 0;
-          const ty = link.target?.y || 0;
-          const mx = (sx + tx) / 2;
-          const my = (sy + ty) / 2;
-          const px = mx - (ty - sy) * 0.086;
-          const py = my + (tx - sx) * 0.086;
-          return `translate(${px}, ${py})`;
-        });
-    });
+    animate();
 
     return () => {
-      simulation.stop();
+      if (animFrameIdRef.current) {
+        cancelAnimationFrame(animFrameIdRef.current);
+      }
+      resizeObserver.disconnect();
+      controls.dispose();
+
+      // Clean up meshes & textures
+      nodeMeshesRef.current.forEach(({ group, sprite, sphere }) => {
+        scene.remove(group);
+        sphere.geometry.dispose();
+        (sphere.material as THREE.Material).dispose();
+        if (sprite.material.map) sprite.material.map.dispose();
+        sprite.material.dispose();
+      });
+      nodeMeshesRef.current.clear();
+
+      linkObjectsRef.current.forEach(({ line }) => {
+        scene.remove(line);
+        line.geometry.dispose();
+        (line.material as THREE.Material).dispose();
+      });
+      linkObjectsRef.current.clear();
+
+      pulseMeshes.forEach((p) => {
+        scene.remove(p.mesh);
+        (p.mesh.material as THREE.Material).dispose();
+      });
+      pulseGeo.dispose();
+
+      starGeometry.dispose();
+      starMaterial.dispose();
+
+      renderer.dispose();
     };
-  }, [nodes, links, clusterMode]);
+  }, []); // Run once on mount
 
-  // Update styles, animated highlight effects, Focus View, and interactions
+  // Sync auto-rotate toggle to OrbitControls
   useEffect(() => {
-    if (!gRef.current) return;
-    const g = d3.select(gRef.current);
+    if (controlsRef.current) {
+      controlsRef.current.autoRotate = isAutoRotate;
+    }
+  }, [isAutoRotate]);
 
-    const isActorSelected = !!selectedActor;
-    const isFocusMode = !!focusedActor;
+  // Populate or Update 3D Nodes in Scene
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
 
-    // Attach canvas background double-click to exit Focus View
-    if (svgRef.current) {
-      d3.select(svgRef.current).on('dblclick', (event) => {
-        const targetTag = (event.target as Element)?.tagName?.toLowerCase();
-        if (targetTag === 'svg' || targetTag === 'rect') {
-          handleExitFocusView();
+    // Build or update nodes
+    const currentNodeIds = new Set(nodes.map((n) => n.id));
+
+    // Remove obsolete nodes
+    nodeMeshesRef.current.forEach((obj, id) => {
+      if (!currentNodeIds.has(id)) {
+        scene.remove(obj.group);
+        obj.sphere.geometry.dispose();
+        (obj.sphere.material as THREE.Material).dispose();
+        if (obj.sprite.material.map) obj.sprite.material.map.dispose();
+        obj.sprite.material.dispose();
+        nodeMeshesRef.current.delete(id);
+      }
+    });
+
+    // Add or update active nodes
+    nodes.forEach((node) => {
+      const catConfig = CATEGORY_COLORS[node.category];
+      const colorHex = catConfig?.hex || '#38bdf8';
+      const score = Math.max(1, Math.min(5, node.influenceScore || 3));
+      const radius = 13 + score * 3.6; // 16.6 to 31 units
+
+      let nodeObj = nodeMeshesRef.current.get(node.id);
+
+      if (!nodeObj) {
+        const group = new THREE.Group();
+
+        // 1. Sphere Mesh
+        const sphereGeo = new THREE.SphereGeometry(radius, 32, 32);
+        const sphereMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(colorHex),
+          emissive: new THREE.Color(colorHex),
+          emissiveIntensity: 0.35,
+          roughness: 0.25,
+          metalness: 0.65,
+        });
+        const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+        sphere.userData = { type: 'node', actorId: node.id };
+        group.add(sphere);
+
+        // 2. Halo ring for superpowers (score >= 4)
+        let halo: THREE.Mesh | undefined;
+        if (score >= 4) {
+          const haloGeo = new THREE.RingGeometry(radius * 1.35, radius * 1.5, 32);
+          const haloMat = new THREE.MeshBasicMaterial({
+            color: new THREE.Color(colorHex),
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.55,
+            blending: THREE.AdditiveBlending,
+          });
+          halo = new THREE.Mesh(haloGeo, haloMat);
+          group.add(halo);
         }
+
+        // 3. Billboard Sprite Label
+        const texture = createActorSpriteTexture(node, false, false);
+        const spriteMat = new THREE.SpriteMaterial({
+          map: texture,
+          transparent: true,
+          opacity: 0.95,
+          depthTest: false,
+        });
+        const sprite = new THREE.Sprite(spriteMat);
+        // Position below or above sphere
+        sprite.position.set(0, -radius - 18, 0);
+        sprite.scale.set(70, 20, 1);
+        group.add(sprite);
+
+        scene.add(group);
+
+        nodeObj = {
+          group,
+          sphere,
+          halo,
+          sprite,
+          baseScale: 1,
+          colorHex,
+        };
+        nodeMeshesRef.current.set(node.id, nodeObj);
+      }
+
+      // Position from layout
+      const pos = nodePositionsRef.current.get(node.id) || { x: 0, y: 0, z: 0 };
+      nodeObj.group.position.set(pos.x, pos.y, pos.z);
+    });
+  }, [nodes]);
+
+  // Populate or Update 3D Links in Scene
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    const currentLinkIds = new Set(links.map((l) => l.id));
+
+    // Remove obsolete links
+    linkObjectsRef.current.forEach((obj, id) => {
+      if (!currentLinkIds.has(id)) {
+        scene.remove(obj.line);
+        obj.line.geometry.dispose();
+        (obj.line.material as THREE.Material).dispose();
+        linkObjectsRef.current.delete(id);
+      }
+    });
+
+    // Add or update active links
+    links.forEach((link) => {
+      const sId = typeof link.source === 'object' ? (link.source as { id: string }).id : link.source;
+      const tId = typeof link.target === 'object' ? (link.target as { id: string }).id : link.target;
+      const sPos = nodePositionsRef.current.get(sId) || { x: 0, y: 0, z: 0 };
+      const tPos = nodePositionsRef.current.get(tId) || { x: 0, y: 0, z: 0 };
+
+      const relConfig = RELATION_CONFIG[link.type];
+      const baseColor = relConfig?.color || '#64748b';
+      const curve = getLinkCurve(sPos, tPos, link.intensity);
+
+      let edgeObj = linkObjectsRef.current.get(link.id);
+
+      if (!edgeObj) {
+        const pts = curve.getPoints(32);
+        const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+        const lineMat = new THREE.LineBasicMaterial({
+          color: new THREE.Color(baseColor),
+          transparent: true,
+          opacity: 0.45,
+          blending: THREE.AdditiveBlending,
+        });
+        const line = new THREE.Line(lineGeo, lineMat);
+        line.userData = { type: 'edge', linkId: link.id };
+        scene.add(line);
+
+        edgeObj = {
+          line,
+          curve,
+          sourceId: sId,
+          targetId: tId,
+          baseColor,
+          baseWidth: link.intensity,
+          link,
+        };
+        linkObjectsRef.current.set(link.id, edgeObj);
+      } else {
+        edgeObj.curve = curve;
+        const pts = curve.getPoints(32);
+        edgeObj.line.geometry.dispose();
+        edgeObj.line.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+      }
+    });
+  }, [links]);
+
+  // Update Dynamic Visual Highlights (Selected Actor, Hover, Focus View, Path Analysis, Search)
+  useEffect(() => {
+    const isSelected = Boolean(selectedActor);
+    const selectedId = selectedActor?.id;
+    const isFocused = Boolean(focusedActor);
+    const focusedId = focusedActor?.id;
+
+    // Find direct neighbors of selected actor
+    const directNeighborIds = new Set<string>();
+    if (selectedId) {
+      links.forEach((l) => {
+        const sId = typeof l.source === 'object' ? (l.source as { id: string }).id : l.source;
+        const tId = typeof l.target === 'object' ? (l.target as { id: string }).id : l.target;
+        if (sId === selectedId) directNeighborIds.add(tId);
+        if (tId === selectedId) directNeighborIds.add(sId);
       });
     }
 
-    // 1. Style Links
-    g.selectAll<SVGPathElement, GraphLink>('.graph-link')
-      .attr('stroke', (d) => {
-        if (isFocusMode) {
-          const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
-          const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
-          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
-          if (isFocalDirect) {
-            const layer = getLinkLayer(d.type);
-            return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
+    const pathSet = new Set(highlightedPathNodeIds);
+    const isPathActive = pathSet.size > 0;
+    const searchTrimmed = searchQuery.trim().toLowerCase();
+    const isSearchActive = searchTrimmed.length > 0;
+
+    // 1. Update Nodes
+    nodeMeshesRef.current.forEach((nodeObj, id) => {
+      const nodeData = allActorsMap.get(id);
+      const isTargetNodeSelected = id === selectedId;
+      const isTargetNodeFocused = id === focusedId;
+      const isNeighbor = directNeighborIds.has(id);
+      const isHovered = hoveredActor?.id === id;
+      const isInPath = pathSet.has(id);
+      const matchesSearch = isSearchActive && (
+        nodeData?.nameFa.toLowerCase().includes(searchTrimmed) ||
+        nodeData?.nameEn.toLowerCase().includes(searchTrimmed) ||
+        nodeData?.acronym?.toLowerCase().includes(searchTrimmed)
+      );
+
+      const sphereMat = nodeObj.sphere.material as THREE.MeshStandardMaterial;
+
+      if (isTargetNodeSelected || isTargetNodeFocused) {
+        sphereMat.emissiveIntensity = 0.95;
+        sphereMat.opacity = 1.0;
+        nodeObj.group.scale.set(1.25, 1.25, 1.25);
+      } else if (isNeighbor || isInPath || matchesSearch) {
+        sphereMat.emissiveIntensity = 0.65;
+        sphereMat.opacity = 1.0;
+        nodeObj.group.scale.set(1.1, 1.1, 1.1);
+      } else if (isSelected || isFocused || isPathActive || isSearchActive) {
+        // Dim unselected / non-neighbor actors
+        sphereMat.emissiveIntensity = 0.1;
+        sphereMat.opacity = 0.25;
+        nodeObj.group.scale.set(0.9, 0.9, 0.9);
+      } else {
+        sphereMat.emissiveIntensity = 0.35;
+        sphereMat.opacity = 0.95;
+        nodeObj.group.scale.set(1.0, 1.0, 1.0);
+      }
+
+      // Sprite LOD visibility
+      if (labelDensityMode === 'none') {
+        nodeObj.sprite.visible = false;
+      } else if (labelDensityMode === 'all') {
+        nodeObj.sprite.visible = true;
+      } else {
+        // 'auto': show if superpower, selected, neighbor, hovered, or in path
+        const score = nodeData?.influenceScore || 3;
+        const shouldShow = score >= 4 || isTargetNodeSelected || isNeighbor || isInPath || isHovered || isTargetNodeFocused || matchesSearch;
+        nodeObj.sprite.visible = shouldShow;
+      }
+    });
+
+    // 2. Update Edges
+    linkObjectsRef.current.forEach((edgeObj, linkId) => {
+      const { line, sourceId, targetId, baseColor } = edgeObj;
+      const lineMat = line.material as THREE.LineBasicMaterial;
+
+      const isConnectedToSelected = selectedId && (sourceId === selectedId || targetId === selectedId);
+      const isConnectedToFocused = focusedId && (sourceId === focusedId || targetId === focusedId);
+      const isBothInPath = isPathActive && pathSet.has(sourceId) && pathSet.has(targetId);
+
+      if (isBothInPath) {
+        lineMat.color.set('#38bdf8');
+        lineMat.opacity = 0.95;
+      } else if (isConnectedToSelected || isConnectedToFocused) {
+        lineMat.color.set(baseColor);
+        lineMat.opacity = 0.9;
+      } else if (isSelected || isFocused || isPathActive) {
+        // Dim unrelated edges
+        lineMat.opacity = 0.08;
+      } else {
+        lineMat.color.set(baseColor);
+        lineMat.opacity = 0.42;
+      }
+    });
+  }, [selectedActor, focusedActor, hoveredActor, highlightedPathNodeIds, searchQuery, labelDensityMode, allActorsMap, links]);
+
+  // Pointer Movement & Raycasting for 3D Hover & Tooltip
+  const handlePointerMove = useCallback((evt: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current || !cameraRef.current || !containerRef.current) return;
+
+    const rect = canvasRef.current.getBoundingClientRect();
+    const mouseX = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
+    const mouseY = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), cameraRef.current);
+
+    // 1. Check Node spheres
+    const nodeSpheres: THREE.Mesh[] = [];
+    nodeMeshesRef.current.forEach((obj) => nodeSpheres.push(obj.sphere));
+    const intersects = raycaster.intersectObjects(nodeSpheres, false);
+
+    if (intersects.length > 0) {
+      const hitMesh = intersects[0].object as THREE.Mesh;
+      const actorId = hitMesh.userData?.actorId;
+      if (actorId) {
+        const actor = allActorsMapRef.current.get(actorId);
+        if (actor) {
+          setHoveredActor(actor);
+          setHoveredLink(null);
+
+          // Compute screen position of node
+          const worldPos = new THREE.Vector3();
+          hitMesh.getWorldPosition(worldPos);
+          const screenPos = worldPos.project(cameraRef.current);
+          const x = (screenPos.x * 0.5 + 0.5) * rect.width;
+          const y = (-(screenPos.y * 0.5) + 0.5) * rect.height;
+
+          setTooltipPos({ x, y });
+          return;
+        }
+      }
+    }
+
+    // 2. Check Edges
+    const edgeLines: THREE.Line[] = [];
+    linkObjectsRef.current.forEach((obj) => edgeLines.push(obj.line));
+    const edgeIntersects = raycaster.intersectObjects(edgeLines, false);
+
+    if (edgeIntersects.length > 0) {
+      const hitLine = edgeIntersects[0].object as THREE.Line;
+      const linkId = hitLine.userData?.linkId;
+      if (linkId) {
+        const link = linksRef.current.find((l) => l.id === linkId);
+        if (link) {
+          setHoveredLink(link);
+          setHoveredActor(null);
+          setTooltipPos({ x: evt.clientX - rect.left, y: evt.clientY - rect.top });
+          return;
+        }
+      }
+    }
+
+    // Clear hover if nothing intersected
+    setHoveredActor(null);
+    setHoveredLink(null);
+    setTooltipPos(null);
+  }, []);
+
+  // Pointer Click & Double Click for Selection and Focus View
+  const lastClickTimeRef = useRef<number>(0);
+  const lastClickedNodeIdRef = useRef<string | null>(null);
+
+  const handlePointerDown = useCallback((evt: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current || !cameraRef.current) return;
+
+    const rect = canvasRef.current.getBoundingClientRect();
+    const mouseX = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
+    const mouseY = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), cameraRef.current);
+
+    const nodeSpheres: THREE.Mesh[] = [];
+    nodeMeshesRef.current.forEach((obj) => nodeSpheres.push(obj.sphere));
+    const intersects = raycaster.intersectObjects(nodeSpheres, false);
+
+    const now = Date.now();
+    const elapsed = now - lastClickTimeRef.current;
+    lastClickTimeRef.current = now;
+
+    if (intersects.length > 0) {
+      const hitMesh = intersects[0].object as THREE.Mesh;
+      const actorId = hitMesh.userData?.actorId;
+      if (actorId) {
+        const actor = allActorsMapRef.current.get(actorId);
+        if (actor) {
+          if (elapsed < 350 && lastClickedNodeIdRef.current === actorId) {
+            // Double Click -> Focus Mode!
+            handleEnterFocusView(actor);
+          } else {
+            // Single Click -> Toggle Selection
+            const currentSelected = selectedActorRef.current;
+            onSelectActorRef.current(currentSelected?.id === actor.id ? null : actor);
+
+            // Smooth camera pan to selected node
+            const pos = nodePositionsRef.current.get(actor.id);
+            if (pos && cameraRef.current) {
+              const nodeVec = new THREE.Vector3(pos.x, pos.y, pos.z);
+              targetLookAtRef.current = nodeVec;
+            }
           }
-          return '#334155';
         }
-        return RELATION_CONFIG[d.type]?.color || '#64748b';
-      })
-      .attr('stroke-width', (d) => {
-        const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
-        const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
-
-        if (isFocusMode) {
-          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
-          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
-          if (isFocalDirect && activeFocusNeighborIds.has(neighborId)) {
-            return Math.max(3.5, d.intensity * 1.35);
-          }
-          return 1;
-        }
-
-        const isConnectedToSelected =
-          isActorSelected && (srcId === selectedActor.id || tgtId === selectedActor.id);
-
-        if (isConnectedToSelected) {
-          return Math.max(3, d.intensity * 1.25);
-        }
-        return Math.max(1.5, d.intensity * 0.9);
-      })
-      .attr('stroke-dasharray', (d) => {
-        const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
-        const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
-
-        if (isFocusMode) {
-          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
-          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
-          if (isFocalDirect && activeFocusNeighborIds.has(neighborId)) {
-            return '8,4';
-          }
-          return 'none';
-        }
-
-        const isConnectedToSelected =
-          isActorSelected && (srcId === selectedActor.id || tgtId === selectedActor.id);
-
-        if (isConnectedToSelected) {
-          return '8,4';
-        }
-        return RELATION_CONFIG[d.type]?.strokeDash || 'none';
-      })
-      .attr('marker-end', (d) => `url(#arrow-${d.type})`)
-      .attr('class', (d) => {
-        const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
-        const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
-
-        if (isFocusMode) {
-          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
-          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
-          const isFlowing = isFocalDirect && activeFocusNeighborIds.has(neighborId);
-          return `graph-link cursor-pointer transition-opacity duration-200 ${isFlowing ? 'link-flowing' : ''}`;
-        }
-
-        const isConnectedToSelected =
-          isActorSelected && (srcId === selectedActor.id || tgtId === selectedActor.id);
-
-        return `graph-link cursor-pointer transition-opacity duration-200 ${
-          isConnectedToSelected ? 'link-flowing' : ''
-        }`;
-      })
-      .attr('opacity', (d) => {
-        const srcId = typeof d.source === 'object' ? (d.source as GraphNode).id : d.source;
-        const tgtId = typeof d.target === 'object' ? (d.target as GraphNode).id : d.target;
-
-        // Focus View mode: Dim non-focused links heavily
-        if (isFocusMode) {
-          const isFocalDirect = srcId === focusedActor.id || tgtId === focusedActor.id;
-          const neighborId = srcId === focusedActor.id ? tgtId : srcId;
-          if (isFocalDirect && activeFocusNeighborIds.has(neighborId)) {
-            return 1;
-          }
-          return 0.02; // heavily dimmed
-        }
-
-        // Path highlighting
-        if (highlightedPathNodeIds.length >= 2) {
-          const inPath =
-            highlightedPathNodeIds.includes(srcId) && highlightedPathNodeIds.includes(tgtId);
-          return inPath ? 1 : 0.06;
-        }
-
-        if (isActorSelected) {
-          const isDirect = srcId === selectedActor.id || tgtId === selectedActor.id;
-          if (isDirect) return 1;
-
-          if (expandToSecondDegree) {
-            const isSecond = firstDegreeNeighbors.has(srcId) && firstDegreeNeighbors.has(tgtId);
-            if (isSecond) return 0.45;
-          }
-          return 0.05; // Fade out unrelated links
-        }
-
-        if (hoveredNodeId) {
-          const isConnected = srcId === hoveredNodeId || tgtId === hoveredNodeId;
-          return isConnected ? 1 : 0.1;
-        }
-
-        return 0.55;
-      })
-      .on('mouseenter', (event, d) => {
-        setHoveredLink(d);
-        const [x, y] = d3.pointer(event, containerRef.current);
-        setTooltipPos({ x, y });
-      })
-      .on('mouseleave', () => {
-        setHoveredLink(null);
-        setTooltipPos(null);
-      });
-
-    // 2. Midpoint Link Badges in Focus View
-    const linkLabelsGroup = g.select<SVGGElement>('.link-labels-layer');
-    if (isFocusMode) {
-      const visibleLinks = focusedDirectLinks.filter((l) => {
-        const srcId = typeof l.source === 'object' ? (l.source as GraphNode).id : l.source;
-        const tgtId = typeof l.target === 'object' ? (l.target as GraphNode).id : l.target;
-        const neighborId = srcId === focusedActor.id ? tgtId : srcId;
-        return activeFocusNeighborIds.has(neighborId);
-      });
-
-      const labelSelection = linkLabelsGroup
-        .selectAll<SVGGElement, GraphLink>('g.focus-link-badge')
-        .data(visibleLinks, (d: unknown) => (d as GraphLink).id);
-
-      labelSelection.exit().remove();
-
-      const labelEnter = labelSelection
-        .enter()
-        .append('g')
-        .attr('class', 'focus-link-badge pointer-events-none');
-
-      labelEnter
-        .append('rect')
-        .attr('rx', 6)
-        .attr('ry', 6)
-        .attr('height', 20)
-        .attr('y', -10);
-
-      labelEnter
-        .append('text')
-        .attr('text-anchor', 'middle')
-        .attr('dominant-baseline', 'central')
-        .style('font-family', 'Vazirmatn, sans-serif')
-        .style('font-size', '10px')
-        .style('font-weight', '600');
-
-      const allBadgeLabels = labelEnter.merge(labelSelection);
-
-      allBadgeLabels.each(function (datum: unknown) {
-        const d = datum as GraphLink;
-        const sel = d3.select(this);
-        const layer = getLinkLayer(d.type);
-        const layerCfg = STRATEGIC_LAYERS[layer];
-        const textStr = `${layerCfg.icon} ${d.typeFa} (${d.intensity}/5)`;
-
-        sel.select('text')
-          .text(textStr)
-          .attr('fill', '#f8fafc');
-
-        const textWidth = Math.max(90, d.typeFa.length * 8.5 + 45);
-        sel.select('rect')
-          .attr('width', textWidth)
-          .attr('x', -textWidth / 2)
-          .attr('fill', '#020617')
-          .attr('stroke', layerCfg.color)
-          .attr('stroke-width', 1.5)
-          .attr('opacity', 0.95);
-      });
+      }
+      lastClickedNodeIdRef.current = actorId;
     } else {
-      linkLabelsGroup.selectAll('*').remove();
+      // Clicked on empty space
+      if (elapsed < 350) {
+        if (focusedActorRef.current) {
+          handleExitFocusView();
+        } else {
+          onSelectActorRef.current(null);
+        }
+      }
+      lastClickedNodeIdRef.current = null;
     }
+  }, [handleEnterFocusView, handleExitFocusView]);
 
-    // 3. Style Nodes
-    g.selectAll<SVGGElement, GraphNode & d3.SimulationNodeDatum>('g.node-group')
-      .attr('opacity', (d) => {
-        // In Focus View: only focused actor and active neighbors have full opacity, rest are heavily dimmed
-        if (isFocusMode) {
-          if (d.id === focusedActor.id) return 1;
-          if (activeFocusNeighborIds.has(d.id)) return 1;
-          return 0.03; // heavily dimmed
-        }
-
-        if (highlightedPathNodeIds.length > 0) {
-          return highlightedPathNodeIds.includes(d.id) ? 1 : 0.1;
-        }
-        if (isActorSelected) {
-          return connectedNeighbors.has(d.id) ? 1 : 0.08;
-        }
-        if (hoveredNodeId) {
-          return connectedNeighbors.has(d.id) ? 1 : 0.15;
-        }
-        if (searchQuery.trim()) {
-          const q = searchQuery.toLowerCase();
-          const match =
-            d.nameFa.toLowerCase().includes(q) ||
-            d.nameEn.toLowerCase().includes(q) ||
-            (d.acronym && d.acronym.toLowerCase().includes(q));
-          return match ? 1 : 0.2;
-        }
-        return 1;
-      })
-      .attr('pointer-events', (d) => {
-        if (isFocusMode) {
-          const isFocalOrNeighbor = d.id === focusedActor.id || activeFocusNeighborIds.has(d.id);
-          return isFocalOrNeighbor ? 'auto' : 'none';
-        }
-        return 'auto';
-      })
-      .on('mouseenter', (event, d) => {
-        setHoveredNodeId(d.id);
-        const [x, y] = d3.pointer(event, containerRef.current);
-        setTooltipPos({ x, y });
-      })
-      .on('mouseleave', () => {
-        setHoveredNodeId(null);
-        setTooltipPos(null);
-      })
-      .on('click', (_event, d) => {
-        const fullActor = allActorsMap.get(d.id);
-        if (fullActor) {
-          // In Focus View, clicking another actor highlights them
-          onSelectActor(selectedActor?.id === d.id ? null : fullActor);
-        }
-      })
-      .on('dblclick', (event, d) => {
-        // Double click enters Focus View
-        event.stopPropagation();
-        event.preventDefault();
-        const fullActor = allActorsMap.get(d.id);
-        if (fullActor) {
-          handleEnterFocusView(fullActor);
-        }
-      });
-
-    // Animated Target Rings for Focused Node
-    g.selectAll<SVGCircleElement, GraphNode>('.node-focus-ring')
-      .attr('display', (d) => (isFocusMode && focusedActor.id === d.id ? 'block' : 'none'))
-      .attr('r', (d) => 28 + (d.influenceScore || 3) * 4.5);
-
-    g.selectAll<SVGCircleElement, GraphNode>('.focus-reticle')
-      .attr('display', (d) => (isFocusMode && focusedActor.id === d.id ? 'block' : 'none'))
-      .attr('r', (d) => 24 + (d.influenceScore || 3) * 4);
-
-    // Animated Pulse Halo for Selected Node (when not in Focus View)
-    g.selectAll<SVGCircleElement, GraphNode>('.node-pulse-ring')
-      .attr('display', (d) => (!isFocusMode && selectedActor?.id === d.id ? 'block' : 'none'))
-      .attr('r', (d) => 24 + (d.influenceScore || 3) * 4);
-
-    // Animated Glowing Halo for Connected Neighbor Nodes
-    g.selectAll<SVGCircleElement, GraphNode>('.node-neighbor-ring')
-      .attr('display', (d) => {
-        if (isFocusMode) {
-          if (d.id === focusedActor.id) return 'none';
-          return activeFocusNeighborIds.has(d.id) ? 'block' : 'none';
-        }
-        if (!isActorSelected || d.id === selectedActor.id) return 'none';
-        return firstDegreeNeighbors.has(d.id) ? 'block' : 'none';
-      })
-      .attr('stroke', (d) => {
-        if (isFocusMode && activeFocusNeighborIds.has(d.id)) {
-          const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
-          return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
-        }
-        return '#38bdf8';
-      })
-      .attr('r', (d) => 20 + (d.influenceScore || 3) * 3.5);
-
-    // Update Circle Sizes & Colors
-    g.selectAll<SVGCircleElement, GraphNode>('.node-core')
-      .attr('r', (d) => {
-        if (isFocusMode && focusedActor.id === d.id) {
-          return 22 + (d.influenceScore || 3) * 3;
-        }
-        return 16 + (d.influenceScore || 3) * 3;
-      })
-      .attr('fill', (d) => {
-        if (isFocusMode && focusedActor.id === d.id) return '#ffffff';
-        const isSelected = selectedActor?.id === d.id;
-        const color = CATEGORY_COLORS[d.category]?.hex || '#3b82f6';
-        return isSelected ? '#ffffff' : color;
-      })
-      .attr('stroke', (d) => {
-        if (isFocusMode) {
-          if (focusedActor.id === d.id) return '#38bdf8';
-          if (activeFocusNeighborIds.has(d.id)) {
-            const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
-            return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
-          }
-          return '#0f172a';
-        }
-        const isSelected = selectedActor?.id === d.id;
-        if (isSelected) return '#38bdf8';
-        if (isActorSelected && firstDegreeNeighbors.has(d.id)) return '#38bdf8';
-        return '#0f172a';
-      })
-      .attr('stroke-width', (d) => {
-        if (isFocusMode) {
-          if (focusedActor.id === d.id) return 4.5;
-          if (activeFocusNeighborIds.has(d.id)) return 3.5;
-          return 1.5;
-        }
-        if (selectedActor?.id === d.id) return 4;
-        if (isActorSelected && firstDegreeNeighbors.has(d.id)) return 2.5;
-        return 2;
-      });
-
-    // Update Ripple Circles
-    g.selectAll<SVGCircleElement, GraphNode>('.node-ripple')
-      .attr('r', (d) => 22 + (d.influenceScore || 3) * 4.5)
-      .attr('stroke', (d) => CATEGORY_COLORS[d.category]?.hex || '#3b82f6')
-      .attr('display', (d) => {
-        if (isFocusMode) {
-          return focusedActor.id === d.id || activeFocusNeighborIds.has(d.id) ? 'block' : 'none';
-        }
-        return showRipples ? 'block' : 'none';
-      });
-
-    // Update Icons/Flags
-    g.selectAll<SVGTextElement, GraphNode>('.node-icon')
-      .text((d) => d.flagEmoji || d.acronym || '★')
-      .attr('font-size', (d) => (d.flagEmoji ? (isFocusMode && focusedActor.id === d.id ? '16px' : '14px') : '10px'))
-      .attr('fill', (d) => {
-        if (isFocusMode && focusedActor.id === d.id) return '#0f172a';
-        return selectedActor?.id === d.id ? '#0f172a' : '#ffffff';
-      });
-
-    // Update Main Persian Labels
-    g.selectAll<SVGTextElement, GraphNode>('.node-label')
-      .text((d) => {
-        if (isFocusMode && focusedActor.id === d.id) return `${d.nameFa} 🎯`;
-        return d.nameFa;
-      })
-      .attr('y', (d) => 22 + (d.influenceScore || 3) * 3 + 12)
-      .attr('fill', (d) => {
-        if (isFocusMode) {
-          if (focusedActor.id === d.id) return '#38bdf8';
-          if (activeFocusNeighborIds.has(d.id)) return '#f8fafc';
-          return '#64748b';
-        }
-        if (selectedActor?.id === d.id) return '#38bdf8';
-        if (isActorSelected && firstDegreeNeighbors.has(d.id)) return '#f8fafc';
-        if (hoveredNodeId === d.id) return '#f8fafc';
-        return '#cbd5e1';
-      })
-      .attr('font-weight', (d) => {
-        if (isFocusMode && (focusedActor.id === d.id || activeFocusNeighborIds.has(d.id))) return '800';
-        if (selectedActor?.id === d.id || (isActorSelected && firstDegreeNeighbors.has(d.id))) return '700';
-        return '600';
-      })
-      .attr('font-size', (d) => {
-        if (isFocusMode && focusedActor.id === d.id) return '13px';
-        return d.influenceScore >= 5 ? '12px' : '10.5px';
-      });
-
-    // Update Sublabels (English/Acronym or Strategic Layer in Focus View)
-    g.selectAll<SVGTextElement, GraphNode>('.node-sublabel')
-      .text((d) => {
-        if (isFocusMode) {
-          if (focusedActor.id === d.id) return 'گره کانونی فوکوس (Focal Point)';
-          if (activeFocusNeighborIds.has(d.id)) {
-            const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
-            const layerCfg = STRATEGIC_LAYERS[layer];
-            return `${layerCfg.icon} ${layerCfg.nameFa}`;
-          }
-        }
-        return d.acronym || d.nameEn.slice(0, 18);
-      })
-      .attr('y', (d) => 22 + (d.influenceScore || 3) * 3 + 24)
-      .attr('fill', (d) => {
-        if (isFocusMode) {
-          if (focusedActor.id === d.id) return '#38bdf8';
-          if (activeFocusNeighborIds.has(d.id)) {
-            const layer = focusedNeighborsMap.get(d.id)?.layer || 'diplomatic';
-            return STRATEGIC_LAYERS[layer]?.color || '#38bdf8';
-          }
-        }
-        return '#94a3b8';
-      })
-      .attr('font-weight', (d) => (isFocusMode && activeFocusNeighborIds.has(d.id) ? '600' : '400'));
-
-    // Update Degree Badges
-    g.selectAll<SVGGElement, GraphNode>('.degree-badge')
-      .attr('display', (d) => {
-        if (isFocusMode) {
-          return focusedActor.id === d.id || activeFocusNeighborIds.has(d.id) ? 'block' : 'none';
-        }
-        return 'block';
-      })
-      .attr('transform', (d) => {
-        const r = 16 + (d.influenceScore || 3) * 3;
-        return `translate(${r * 0.72}, ${-r * 0.72})`;
-      })
-      .select('text')
-      .text((d) => d.degree || 0);
-
-    // Apply Level of Detail (LOD) label display & styling for current zoom
-    applyLabelsLOD(currentZoomKRef.current);
-
-  }, [
-    focusedActor,
-    focusLayer,
-    focusedDirectLinks,
-    focusedNeighborsMap,
-    activeFocusNeighborIds,
-    handleEnterFocusView,
-    handleExitFocusView,
-    activeFocusId,
-    connectedNeighbors,
-    firstDegreeNeighbors,
-    selectedActor,
-    hoveredNodeId,
-    highlightedPathNodeIds,
-    searchQuery,
-    labelDensityMode,
-    applyLabelsLOD,
-    showRipples,
-    expandToSecondDegree,
-    allActorsMap,
-    onSelectActor,
-  ]);
-
-  // Zoom control helpers
-  const handleZoom = useCallback((factor: number) => {
-    if (!svgRef.current || !zoomBehaviorRef.current) return;
-    d3.select(svgRef.current)
-      .transition()
-      .duration(300)
-      .call(zoomBehaviorRef.current.scaleBy, factor);
+  // Zoom In / Out Handlers
+  const handleZoomIn = useCallback(() => {
+    if (cameraRef.current && controlsRef.current) {
+      const cam = cameraRef.current;
+      const target = controlsRef.current.target;
+      const dir = cam.position.clone().sub(target).multiplyScalar(0.75);
+      cam.position.copy(target.clone().add(dir));
+    }
   }, []);
 
-  const handleResetZoom = useCallback(() => {
-    if (!svgRef.current || !zoomBehaviorRef.current) return;
-    d3.select(svgRef.current)
-      .transition()
-      .duration(500)
-      .call(zoomBehaviorRef.current.transform, d3.zoomIdentity);
+  const handleZoomOut = useCallback(() => {
+    if (cameraRef.current && controlsRef.current) {
+      const cam = cameraRef.current;
+      const target = controlsRef.current.target;
+      const dir = cam.position.clone().sub(target).multiplyScalar(1.3);
+      cam.position.copy(target.clone().add(dir));
+    }
   }, []);
 
-  const handleFitView = useCallback(() => {
-    if (!svgRef.current || !zoomBehaviorRef.current || !containerRef.current || nodes.length === 0) return;
-    const width = containerRef.current.clientWidth;
-    const height = containerRef.current.clientHeight;
-
-    d3.select(svgRef.current)
-      .transition()
-      .duration(600)
-      .call(
-        zoomBehaviorRef.current.transform,
-        d3.zoomIdentity.translate(width / 2, height / 2).scale(0.85).translate(-width / 2, -height / 2)
-      );
-  }, [nodes]);
-
-  // Center on Selected Actor
-  const handleCenterOnActor = useCallback((actorId: string) => {
-    if (!svgRef.current || !zoomBehaviorRef.current || !containerRef.current) return;
-    const nodeEl = nodes.find((n) => n.id === actorId);
-    if (!nodeEl || nodeEl.x === undefined || nodeEl.y === undefined) return;
-
-    const width = containerRef.current.clientWidth;
-    const height = containerRef.current.clientHeight;
-
-    d3.select(svgRef.current)
-      .transition()
-      .duration(700)
-      .call(
-        zoomBehaviorRef.current.transform,
-        d3.zoomIdentity
-          .translate(width / 2, height / 2)
-          .scale(1.4)
-          .translate(-nodeEl.x, -nodeEl.y)
-      );
-  }, [nodes]);
-
-  const activeHoveredActor = hoveredNodeId ? allActorsMap.get(hoveredNodeId) : null;
+  const handleResetCamera = useCallback(() => {
+    targetCamPosRef.current = new THREE.Vector3(0, 240, 880);
+    targetLookAtRef.current = new THREE.Vector3(0, 0, 0);
+  }, []);
 
   return (
     <div
       ref={containerRef}
       className="relative w-full h-full overflow-hidden bg-slate-950 select-none"
-      id="graph-viewport-container"
+      id="threejs-graph-viewport"
     >
-      {/* Background Geopolitical Grid & Radial Glow */}
-      <div 
-        className="absolute inset-0 pointer-events-none opacity-20"
-        style={{
-          backgroundImage: `
-            radial-gradient(circle at 50% 50%, rgba(56, 189, 248, 0.12) 0%, transparent 70%),
-            linear-gradient(to right, rgba(255,255,255,0.03) 1px, transparent 1px),
-            linear-gradient(to bottom, rgba(255,255,255,0.03) 1px, transparent 1px)
-          `,
-          backgroundSize: '100% 100%, 48px 48px, 48px 48px'
-        }}
+      {/* 3D WebGL Canvas */}
+      <canvas
+        ref={canvasRef}
+        onPointerMove={handlePointerMove}
+        onPointerDown={handlePointerDown}
+        className="w-full h-full cursor-grab active:cursor-grabbing block"
+        id="geopolitical-threejs-canvas"
       />
 
-      {/* D3 SVG Canvas */}
-      <svg ref={svgRef} className="w-full h-full cursor-grab active:cursor-grabbing" id="geopolitical-d3-svg">
-        <defs>
-          {/* Arrow markers for each relation type */}
-          {(Object.keys(RELATION_CONFIG) as RelationType[]).map((relType) => (
-            <marker
-              key={relType}
-              id={`arrow-${relType}`}
-              viewBox="0 -5 10 10"
-              refX={22}
-              refY={0}
-              markerWidth={6}
-              markerHeight={6}
-              orient="auto"
-            >
-              <path d="M0,-5L10,0L0,5" fill={RELATION_CONFIG[relType].color} />
-            </marker>
-          ))}
-          {/* Node shadow filter */}
-          <filter id="node-glow" x="-50%" y="-50%" width="200%" height="200%">
-            <feDropShadow dx="0" dy="0" stdDeviation="4" floodColor="#38bdf8" floodOpacity="0.4" />
-          </filter>
-        </defs>
+      {/* Top Floating Control Bar: 3D Layout Engines & Orbit Controls */}
+      <div className="absolute top-3 left-3 z-20 flex flex-wrap items-center gap-1.5 bg-slate-900/90 backdrop-blur-md p-1.5 rounded-xl border border-slate-800 shadow-2xl">
+        {/* 3D Layout Engines */}
+        <div className="flex items-center gap-1 border-l border-slate-700/60 pl-1.5">
+          <button
+            onClick={() => setLayoutType('sphere')}
+            className={`px-2.5 py-1 text-xs rounded-lg font-vazir transition-all flex items-center gap-1.5 ${
+              layoutType === 'sphere'
+                ? 'bg-sky-500/20 text-sky-400 border border-sky-500/40 font-bold'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+            }`}
+            title="چیدمان منظومه کروی سه‌بعدی (3D Planetary Galaxy)"
+          >
+            <Compass className="w-3.5 h-3.5" />
+            <span>منظومه کروی</span>
+          </button>
 
-        <g ref={gRef}>
-          <g className="links-layer" />
-          <g className="nodes-layer" />
-        </g>
-      </svg>
+          <button
+            onClick={() => setLayoutType('force')}
+            className={`px-2.5 py-1 text-xs rounded-lg font-vazir transition-all flex items-center gap-1.5 ${
+              layoutType === 'force'
+                ? 'bg-sky-500/20 text-sky-400 border border-sky-500/40 font-bold'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+            }`}
+            title="شبیه‌سازی تعادلی فیزیک ذرات سه‌بعدی (3D Force-Directed)"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>فیزیک تعادلی</span>
+          </button>
 
-      {/* Floating Interactive Connection HUD (Displays upon Node Click when NOT in Focus View) */}
-      {selectedActor && !focusedActor && (
-        <div
-          className="absolute top-4 right-4 z-30 bg-slate-900/95 backdrop-blur-xl border border-cyan-500/40 p-4 rounded-2xl shadow-2xl max-w-sm w-80 text-right font-vazir animate-in fade-in slide-in-from-top-2 duration-300"
-          id="actor-connection-hud"
-        >
-          {/* HUD Header */}
-          <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3 mb-3">
-            <div className="flex items-center gap-2.5">
-              <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xl shrink-0 shadow-inner">
-                {selectedActor.flagEmoji || '🏛️'}
-              </div>
-              <div>
-                <div className="flex items-center gap-1.5">
-                  <h3 className="font-extrabold text-slate-100 text-sm">{selectedActor.nameFa}</h3>
-                  {selectedActor.acronym && (
-                    <span className="text-[10px] text-cyan-400 font-bold bg-cyan-950 px-1 rounded">
-                      {selectedActor.acronym}
-                    </span>
-                  )}
-                </div>
-                <p className="text-[11px] text-slate-400 font-sans">{selectedActor.nameEn}</p>
-              </div>
-            </div>
+          <button
+            onClick={() => setLayoutType('concentric')}
+            className={`px-2.5 py-1 text-xs rounded-lg font-vazir transition-all flex items-center gap-1.5 ${
+              layoutType === 'concentric'
+                ? 'bg-sky-500/20 text-sky-400 border border-sky-500/40 font-bold'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+            }`}
+            title="مدارهای هم‌مرکز قدرت و نفوذ (3D Concentric Orbits)"
+          >
+            <CircleDot className="w-3.5 h-3.5" />
+            <span>مدارهای نفوذ</span>
+          </button>
 
-            <button
-              onClick={() => onSelectActor(null)}
-              className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
-              title="لغو هایلایت و بستن (Esc)"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-
-          {/* Connection Stats & Highlight Indicator */}
-          <div className="space-y-2.5 mb-3">
-            <div className="flex items-center justify-between text-xs bg-slate-950/70 px-3 py-2 rounded-xl border border-slate-800">
-              <span className="text-slate-400 flex items-center gap-1.5">
-                <Network className="w-3.5 h-3.5 text-cyan-400" />
-                بازیگران در شبکه هایلایت‌شده:
-              </span>
-              <strong className="text-cyan-300 font-bold">
-                {firstDegreeNeighbors.size} بازیگر مستقیم
-              </strong>
-            </div>
-
-            {/* Direct Relationship Type Breakdown Pills */}
-            {selectedActorLinkBreakdown && (
-              <div className="grid grid-cols-2 gap-1.5 text-[11px]">
-                {selectedActorLinkBreakdown.conflicts > 0 && (
-                  <div className="bg-rose-950/40 border border-rose-800/40 text-rose-300 px-2.5 py-1 rounded-lg flex items-center justify-between">
-                    <span>⚔️ تقابل و منازعه:</span>
-                    <strong>{selectedActorLinkBreakdown.conflicts}</strong>
-                  </div>
-                )}
-                {selectedActorLinkBreakdown.alliances > 0 && (
-                  <div className="bg-emerald-950/40 border border-emerald-800/40 text-emerald-300 px-2.5 py-1 rounded-lg flex items-center justify-between">
-                    <span>🤝 هم‌پیمانی:</span>
-                    <strong>{selectedActorLinkBreakdown.alliances}</strong>
-                  </div>
-                )}
-                {selectedActorLinkBreakdown.economic > 0 && (
-                  <div className="bg-amber-950/40 border border-amber-800/40 text-amber-300 px-2.5 py-1 rounded-lg flex items-center justify-between">
-                    <span>💼 اقتصادی و انرژی:</span>
-                    <strong>{selectedActorLinkBreakdown.economic}</strong>
-                  </div>
-                )}
-                {selectedActorLinkBreakdown.diplomatic > 0 && (
-                  <div className="bg-cyan-950/40 border border-cyan-800/40 text-cyan-300 px-2.5 py-1 rounded-lg flex items-center justify-between">
-                    <span>🕊️ دیپلماتیک:</span>
-                    <strong>{selectedActorLinkBreakdown.diplomatic}</strong>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Quick Enter Focus View Banner */}
-          <div className="mb-3 p-2.5 bg-gradient-to-r from-cyan-950/60 to-blue-950/60 border border-cyan-500/30 rounded-xl flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="text-lg animate-pulse">🎯</span>
-              <div className="text-[11px]">
-                <p className="text-cyan-200 font-bold">دید متمرکز (Focus View)</p>
-                <p className="text-slate-400 text-[10px]">کمرنگ‌سازی سایر گره‌ها و تفکیک لایه‌ای</p>
-              </div>
-            </div>
-            <button
-              onClick={() => handleEnterFocusView(selectedActor)}
-              className="px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold transition-all shadow hover:shadow-cyan-500/25 flex items-center gap-1 shrink-0"
-              title="ورود به Focus View (یا دبل‌کلیک روی گره)"
-            >
-              <Layers className="w-3.5 h-3.5" />
-              <span>ورود به فوکوس</span>
-            </button>
-          </div>
-
-          {/* 2nd Degree Neighborhood Toggle */}
-          <div className="flex items-center justify-between bg-slate-950/40 p-2 rounded-xl border border-slate-800/60 mb-3 text-xs">
-            <span className="text-slate-400 text-[11px]">گسترش به شبکه درجه ۲:</span>
-            <button
-              onClick={() => setExpandToSecondDegree(!expandToSecondDegree)}
-              className={`px-2.5 py-0.5 rounded-lg text-[11px] font-semibold transition-colors ${
-                expandToSecondDegree
-                  ? 'bg-purple-600 text-white shadow'
-                  : 'bg-slate-800 text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              {expandToSecondDegree ? 'فعال (شبکه گسترده)' : 'خاموش'}
-            </button>
-          </div>
-
-          {/* Action Buttons */}
-          <div className="flex items-center gap-2 pt-1 border-t border-slate-800 text-xs">
-            <button
-              onClick={() => handleCenterOnActor(selectedActor.id)}
-              className="flex-1 py-1.5 px-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl transition-colors flex items-center justify-center gap-1 text-[11px] font-semibold"
-              title="مرکزیت و زوم روی گره"
-            >
-              <Target className="w-3.5 h-3.5 text-cyan-400" />
-              <span>تمرکز نما</span>
-            </button>
-
-            {onOpenDetailsModal && (
-              <button
-                onClick={() => onOpenDetailsModal(selectedActor)}
-                className="flex-1 py-1.5 px-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl transition-colors flex items-center justify-center gap-1 text-[11px] font-semibold shadow-md"
-                title="مشاهده پرونده کامل"
-              >
-                <FileText className="w-3.5 h-3.5" />
-                <span>پرونده کامل</span>
-              </button>
-            )}
-
-            <button
-              onClick={() => onSelectActor(null)}
-              className="py-1.5 px-2.5 bg-slate-800 hover:bg-rose-900/60 text-slate-400 hover:text-rose-200 rounded-xl transition-colors text-[11px]"
-              title="لغو هایلایت"
-            >
-              لغو
-            </button>
-          </div>
+          <button
+            onClick={() => setLayoutType('plane')}
+            className={`px-2.5 py-1 text-xs rounded-lg font-vazir transition-all flex items-center gap-1.5 ${
+              layoutType === 'plane'
+                ? 'bg-sky-500/20 text-sky-400 border border-sky-500/40 font-bold'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+            }`}
+            title="صفحه راهبردی با ارتفاع متناسب با سطح اقتدار (2.5D Strategic Elevation)"
+          >
+            <Grid className="w-3.5 h-3.5" />
+            <span>صفحه راهبردی</span>
+          </button>
         </div>
-      )}
 
-      {/* Focus View Dedicated Interactive Overlay Panel */}
+        {/* Auto Rotate Toggle */}
+        <button
+          onClick={() => setIsAutoRotate((prev) => !prev)}
+          className={`px-2 py-1 text-xs rounded-lg font-vazir transition-all flex items-center gap-1.5 border ${
+            isAutoRotate
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40 font-semibold'
+              : 'text-slate-400 border-transparent hover:bg-slate-800'
+          }`}
+          title="چرخش خودکار دوربین سه‌بعدی"
+        >
+          {isAutoRotate ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+          <span>{isAutoRotate ? 'چرخش فعال' : 'چرخش ایستا'}</span>
+        </button>
+
+        {/* Label LOD Density Toggle */}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => {
+              setLabelDensityMode((prev) => (prev === 'auto' ? 'all' : prev === 'all' ? 'none' : 'auto'));
+            }}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg font-vazir text-slate-300 hover:bg-slate-800 transition-colors"
+            title="تراکم نمایش برچسب‌های سه‌بعدی (LOD)"
+          >
+            {labelDensityMode === 'none' ? (
+              <EyeOff className="w-3.5 h-3.5 text-slate-500" />
+            ) : (
+              <Eye className="w-3.5 h-3.5 text-sky-400" />
+            )}
+            <span className="text-[11px]">
+              برچسب: {labelDensityMode === 'auto' ? 'هوشمند' : labelDensityMode === 'all' ? 'کامل' : 'مخفی'}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      {/* Floating 3D Camera Controls */}
+      <div className="absolute right-3 top-3 z-20 flex flex-col gap-1.5 bg-slate-900/90 backdrop-blur-md p-1.5 rounded-xl border border-slate-800 shadow-2xl">
+        <button
+          onClick={handleZoomIn}
+          className="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
+          title="بزرگ‌نمایی سه‌بعدی"
+        >
+          <ZoomIn className="w-4 h-4" />
+        </button>
+        <button
+          onClick={handleZoomOut}
+          className="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
+          title="کوچک‌نمایی سه‌بعدی"
+        >
+          <ZoomOut className="w-4 h-4" />
+        </button>
+        <button
+          onClick={handleResetCamera}
+          className="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
+          title="بازنشانی زاویه دید و مرکزنمایی"
+        >
+          <Maximize2 className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* 3D Engine Badge / HUD */}
+      <div className="absolute top-3 right-16 z-10 hidden sm:flex items-center gap-1.5 bg-slate-900/80 backdrop-blur-md px-2.5 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-sky-400/90 shadow-md">
+        <Activity className="w-3 h-3 text-sky-400 animate-pulse" />
+        <span>THREE.JS 3D WEBGL ENGINE</span>
+      </div>
+
+      {/* Advanced Hover Tooltip (Smart Boundary Safe) */}
+      <GraphTooltip
+        activeHoveredActor={hoveredActor}
+        hoveredLink={hoveredLink}
+        tooltipPos={tooltipPos}
+        containerRef={containerRef}
+        selectedActor={selectedActor}
+        focusedActor={focusedActor}
+        allActorsMap={allActorsMap}
+        links={links}
+        onOpenDetailsModal={onOpenDetailsModal}
+        onEnterFocusView={handleEnterFocusView}
+      />
+
+      {/* Focus View Overlay (when focusedActor is active) */}
       {focusedActor && (
         <FocusViewOverlay
           focusedActor={focusedActor}
-          directLinks={focusedDirectLinks}
-          allActorsMap={allActorsMap}
-          activeLayer={focusLayer}
-          onChangeLayer={setFocusLayer}
-          onExitFocusView={handleExitFocusView}
-          onCenterOnActor={handleCenterOnActor}
-          onSelectActorForFocus={(actor) => {
-            handleEnterFocusView(actor);
+          focusLayer={focusLayer}
+          onSelectLayer={setFocusLayer}
+          onClose={handleExitFocusView}
+          neighborEntries={Array.from(focusedNeighborsMap.values())}
+          onSelectActor={(neighbor) => {
+            onSelectActor(neighbor);
           }}
           onOpenDetailsModal={onOpenDetailsModal}
         />
       )}
 
-      {/* Floating Canvas Controls */}
-      <div 
-        className="absolute top-4 left-4 flex flex-col gap-1.5 bg-slate-900/90 backdrop-blur-md border border-slate-800 p-1.5 rounded-xl shadow-2xl z-20"
-        id="graph-controls-panel"
-      >
-        <button
-          onClick={() => handleZoom(1.3)}
-          className="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
-          title="بزرگ‌نمایی (Zoom In)"
-          id="btn-zoom-in"
-        >
-          <ZoomIn className="w-4 h-4" />
-        </button>
-        <button
-          onClick={() => handleZoom(0.7)}
-          className="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
-          title="کوچک‌نمایی (Zoom Out)"
-          id="btn-zoom-out"
-        >
-          <ZoomOut className="w-4 h-4" />
-        </button>
-        <button
-          onClick={handleFitView}
-          className="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
-          title="تنظیم نمای کامل (Fit View)"
-          id="btn-fit-view"
-        >
-          <Maximize2 className="w-4 h-4" />
-        </button>
-        <button
-          onClick={handleResetZoom}
-          className="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
-          title="بازنشانی موقعیت (Reset View)"
-          id="btn-reset-view"
-        >
-          <RotateCcw className="w-4 h-4" />
-        </button>
-        <div className="h-px bg-slate-800 my-1" />
-        {/* Label Density Mode Button (Intelligent LOD / All / None) */}
-        <button
-          onClick={() => {
-            const nextMode: 'auto' | 'all' | 'none' =
-              labelDensityMode === 'auto' ? 'all' : labelDensityMode === 'all' ? 'none' : 'auto';
-            setLabelDensityMode(nextMode);
-          }}
-          className={`p-2 rounded-lg transition-colors relative flex items-center justify-center ${
-            labelDensityMode === 'auto'
-              ? 'text-cyan-400 bg-cyan-950/50 hover:bg-cyan-900/50'
-              : labelDensityMode === 'all'
-              ? 'text-emerald-400 bg-emerald-950/50 hover:bg-emerald-900/50'
-              : 'text-slate-500 hover:text-white hover:bg-slate-800'
-          }`}
-          title={
-            labelDensityMode === 'auto'
-              ? `تراکم هوشمند برچسب‌ها فعال (زوم: ${zoomScale}%) - در زوم‌اوت بازیگران کلیدی اولویت دارند. کلیک برای نمایش همه`
-              : labelDensityMode === 'all'
-              ? 'نمایش همه برچسب‌ها بدون فیلتر. کلیک برای مخفی‌سازی کامل'
-              : 'مخفی‌سازی کامل برچسب‌ها. کلیک برای بازگشت به تراکم خودکار'
-          }
-          id="btn-label-density"
-        >
-          {labelDensityMode === 'auto' ? (
-            <div className="relative flex items-center justify-center">
-              <Eye className="w-4 h-4" />
-              <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-cyan-400 shadow-sm shadow-cyan-400" />
-            </div>
-          ) : labelDensityMode === 'all' ? (
-            <Eye className="w-4 h-4" />
-          ) : (
-            <EyeOff className="w-4 h-4" />
-          )}
-        </button>
-
-        {/* Zoom Scale Badge */}
-        <div
-          className="text-[9px] font-mono text-center text-slate-400 py-0.5 px-1 bg-slate-950/70 rounded border border-slate-800/80 select-none"
-          title={`مقیاس فعلی زوم: ${zoomScale}%`}
-        >
-          {zoomScale}%
-        </div>
-
-        <button
-          onClick={() => setShowRipples(!showRipples)}
-          className={`p-2 rounded-lg transition-colors ${
-            showRipples ? 'text-emerald-400 bg-emerald-950/40' : 'text-slate-400 hover:text-white hover:bg-slate-800'
-          }`}
-          title="حلقه‌های شعاع نفوذ"
-          id="btn-toggle-ripples"
-        >
-          <Sparkles className="w-4 h-4" />
-        </button>
+      {/* Bottom Hint Banner */}
+      <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-10 pointer-events-none hidden md:flex items-center gap-4 bg-slate-900/80 backdrop-blur-md border border-slate-800/80 px-4 py-1.5 rounded-full text-[11px] text-slate-300 font-vazir shadow-xl">
+        <span className="flex items-center gap-1">
+          <span className="text-sky-400">🖱️</span>
+          <span>درگ چپ = چرخش ۳۶۰ درجه • چرخ ماوس = زوم</span>
+        </span>
+        <span className="w-1 h-1 rounded-full bg-slate-700" />
+        <span className="flex items-center gap-1">
+          <span className="text-cyan-400">👆</span>
+          <span>کلیک = انتخاب و فوکوس دوربین</span>
+        </span>
+        <span className="w-1 h-1 rounded-full bg-slate-700" />
+        <span className="flex items-center gap-1">
+          <span className="text-amber-400">🎯</span>
+          <span>دبل‌کلیک = نمای تمرکز (Focus View)</span>
+        </span>
       </div>
-
-      {/* Floating Status & Node Count Badge (Floats safely above bottom timeline) */}
-      <div 
-        className="absolute bottom-20 left-4 flex items-center gap-3 bg-slate-900/90 backdrop-blur-md border border-slate-800/90 px-3.5 py-2 rounded-xl text-xs text-slate-400 z-10 font-sans shadow-xl"
-        id="graph-status-bar"
-      >
-        <div className="flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          <span className="text-slate-200 font-medium">{nodes.length} بازیگر فعال</span>
-        </div>
-        <span className="text-slate-600">|</span>
-        <div className="flex items-center gap-1.5">
-          <span className="text-slate-200 font-medium">{links.length} رابطه ژئوپلیتیک</span>
-        </div>
-        {labelDensityMode === 'auto' && (
-          <>
-            <span className="text-slate-600 hidden xl:inline">|</span>
-            <span className="text-cyan-400/90 font-vazir text-[11px] hidden xl:inline flex items-center gap-1">
-              <span>✨</span>
-              <span>تراکم هوشمند: اولویت به بازیگران راهبردی در زوم‌اوت</span>
-            </span>
-          </>
-        )}
-        {selectedActor && (
-          <>
-            <span className="text-slate-600">|</span>
-            <span className="text-cyan-400 font-medium font-vazir truncate max-w-[140px]">
-              انتخاب: {selectedActor.nameFa}
-            </span>
-          </>
-        )}
-        {!focusedActor && (
-          <>
-            <span className="text-slate-600 hidden lg:inline">|</span>
-            <span className="text-cyan-400/80 font-vazir text-[11px] hidden lg:inline flex items-center gap-1">
-              <span>🎯</span>
-              <span>دبل‌کلیک روی گره = Focus View لایه‌بندی‌شده</span>
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* Floating Node Hover Tooltip (Only if not clicked on node) */}
-      {activeHoveredActor && tooltipPos && !selectedActor && !focusedActor && (
-        <div
-          className="absolute z-40 pointer-events-none transform -translate-x-1/2 -translate-y-full mb-3 bg-slate-900/95 backdrop-blur-md border border-slate-700/80 p-3.5 rounded-xl shadow-2xl max-w-sm w-72 text-right transition-opacity duration-150"
-          style={{ left: `${tooltipPos.x}px`, top: `${tooltipPos.y - 12}px` }}
-          id="graph-node-tooltip"
-        >
-          <div className="flex items-start justify-between gap-2 border-b border-slate-800 pb-2 mb-2">
-            <div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-base">{activeHoveredActor.flagEmoji}</span>
-                <span className="font-bold text-slate-100 text-sm font-vazir">{activeHoveredActor.nameFa}</span>
-              </div>
-              <p className="text-[11px] text-slate-400">{activeHoveredActor.nameEn}</p>
-            </div>
-            <span 
-              className="text-[10px] px-2 py-0.5 rounded-full font-medium"
-              style={{
-                backgroundColor: `${CATEGORY_COLORS[activeHoveredActor.category]?.hex || '#38bdf8'}20`,
-                color: CATEGORY_COLORS[activeHoveredActor.category]?.hex || '#38bdf8',
-              }}
-            >
-              قدرت: {activeHoveredActor.influenceScore}/5
-            </span>
-          </div>
-
-          <p className="text-xs text-slate-300 leading-relaxed line-clamp-3 mb-2 font-vazir">
-            {activeHoveredActor.geopoliticalRole}
-          </p>
-
-          <div className="grid grid-cols-2 gap-1.5 text-[11px] border-t border-slate-800/80 pt-2 text-slate-400">
-            <div>
-              <span className="text-slate-500">جغرافیا: </span>
-              <span className="text-slate-300 font-vazir">{activeHoveredActor.geography}</span>
-            </div>
-            <div>
-              <span className="text-slate-500">جهت‌گیری: </span>
-              <span className="text-slate-300 font-vazir">{activeHoveredActor.alignment}</span>
-            </div>
-          </div>
-
-          <div className="mt-2 pt-1.5 border-t border-slate-800 text-[10px] text-cyan-400 flex flex-col gap-1">
-            <div className="flex items-center justify-between">
-              <span>کلیک: هایلایت روابط متصل</span>
-              <span>{firstDegreeNeighbors.size} پیوند</span>
-            </div>
-            <div className="text-amber-300/90 font-medium">
-              ⚡ دبل‌کلیک: ورود به Focus View لایه‌بندی‌شده
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Floating Link Hover Tooltip */}
-      {hoveredLink && tooltipPos && !activeHoveredActor && (
-        <div
-          className="absolute z-40 pointer-events-none transform -translate-x-1/2 -translate-y-full mb-3 bg-slate-900/95 backdrop-blur-md border border-slate-700/80 p-3 rounded-xl shadow-2xl max-w-xs w-64 text-right"
-          style={{ left: `${tooltipPos.x}px`, top: `${tooltipPos.y - 10}px` }}
-          id="graph-link-tooltip"
-        >
-          <div className="flex items-center gap-1.5 mb-1.5">
-            <span 
-              className="w-2.5 h-2.5 rounded-full shrink-0" 
-              style={{ backgroundColor: RELATION_CONFIG[hoveredLink.type]?.color }} 
-            />
-            <span className="font-semibold text-xs text-slate-200 font-vazir">{hoveredLink.typeFa}</span>
-            <span className="text-[10px] text-slate-400 mr-auto">شدت {hoveredLink.intensity}/5</span>
-          </div>
-          <p className="text-xs text-slate-300 leading-relaxed font-vazir">{hoveredLink.description}</p>
-        </div>
-      )}
     </div>
   );
 };
